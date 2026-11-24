@@ -1,0 +1,40 @@
+# Sanal ortam
+.venv/
+venv/
+env/
+
+# Python önbellek ve derleme çıktıları
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Test / araç önbellekleri
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Geçici dosyalar
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*~
+output/
+tmp/
+
+# IDE dosyaları (paylaşılan VS Code ayarları hariç)
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+
+# İşletim sistemi dosyaları
+Thumbs.db
+desktop.ini
+.DS_Store
