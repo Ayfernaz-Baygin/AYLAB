@@ -20,7 +20,7 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractSpinBox,
@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from app import theme
-from processing.registry import BoolParam, ChoiceParam, FloatParam, IntParam, ParamSpec
+from processing.registry import BoolParam, ChoiceParam, FloatParam, IntParam, MaskParam, ParamSpec
 
 
 class ParameterControl(QWidget):
@@ -286,6 +286,158 @@ class ToggleControl(ParameterControl):
         self.switch.setPalette(pal)
 
 
+class MaskGrid(QWidget):
+    """Tıklanabilir ikili ızgara: sol tık hücreyi aç/kapat, sağ tık orijini taşı."""
+
+    changed = Signal()
+    CELL = 22
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.grid: list[list[int]] = [[1]]
+        self.origin = (0, 0)
+        self.accent = QColor(theme.NEUTRAL_ACCENT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Left click: toggle a cell · Right click: move the origin")
+
+    def set_grid(self, grid, origin) -> None:
+        self.grid = [list(r) for r in grid]
+        self.origin = tuple(origin)
+        self.setFixedSize(self.sizeHint())
+        self.update()
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return QSize(len(self.grid[0]) * self.CELL + 1, len(self.grid) * self.CELL + 1)
+
+    def _cell_at(self, event: QMouseEvent) -> tuple[int, int] | None:
+        pos = event.position()
+        r, c = int(pos.y() // self.CELL), int(pos.x() // self.CELL)
+        return (r, c) if 0 <= r < len(self.grid) and 0 <= c < len(self.grid[0]) else None
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        cell = self._cell_at(event)
+        if cell is None:
+            return
+        r, c = cell
+        if event.button() == Qt.MouseButton.RightButton:
+            self.origin = (r, c)
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.grid[r][c] ^= 1
+            if not any(any(row) for row in self.grid):      # en az bir hücre kalmalı
+                self.grid[r][c] = 1
+                return
+        else:
+            return
+        self.update()
+        self.changed.emit()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        n = self.CELL
+        for r, row in enumerate(self.grid):
+            for c, v in enumerate(row):
+                p.fillRect(c * n, r * n, n, n, theme.with_alpha(self.accent, 170) if v else QColor(theme.PANEL_RAISED))
+        p.setPen(QPen(QColor(theme.LINE), 1))
+        for r in range(len(self.grid) + 1):
+            p.drawLine(0, r * n, len(self.grid[0]) * n, r * n)
+        for c in range(len(self.grid[0]) + 1):
+            p.drawLine(c * n, 0, c * n, len(self.grid) * n)
+        r, c = self.origin                                       # orijin: halka + nokta
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor(theme.TEXT), 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QRectF(c * n + 5, r * n + 5, n - 10, n - 10))
+        p.setBrush(QColor(theme.TEXT))
+        p.drawEllipse(QRectF(c * n + n / 2 - 2, r * n + n / 2 - 2, 4, 4))
+        p.end()
+
+
+class MaskControl(ParameterControl):
+    """Özel yapı elemanı: ızgara boyutu (3 / 5 / 7) + hücre düzenleyici + orijin."""
+
+    SIZES = (3, 5, 7)
+
+    def __init__(self, spec: MaskParam, parent=None) -> None:
+        super().__init__(spec, parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(5)
+        self.origin_label = QLabel()
+        self.origin_label.setObjectName("Faint")
+        self._header(layout, self.origin_label)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self.size_buttons: dict[int, QPushButton] = {}
+        group = QButtonGroup(self)
+        group.setExclusive(True)
+        for n in self.SIZES:
+            if n > spec.max_size:
+                continue
+            b = QPushButton(f"{n} × {n}")
+            b.setObjectName("Segment")
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _c=False, k=n: self._resize(k))
+            group.addButton(b)
+            row.addWidget(b, 1)
+            self.size_buttons[n] = b
+        layout.addLayout(row)
+        self.grid = MaskGrid()
+        self.grid.changed.connect(self._emit)
+        hint = QLabel("left click: cell · right click: origin")
+        hint.setObjectName("Faint")
+        grid_row = QHBoxLayout()
+        grid_row.setContentsMargins(0, 2, 0, 0)
+        grid_row.addWidget(self.grid)
+        grid_row.addSpacing(10)
+        grid_row.addWidget(hint, 1, Qt.AlignmentFlag.AlignTop)
+        hint.setWordWrap(True)
+        layout.addLayout(grid_row)
+        self.set_value(spec.default)
+
+    def value(self) -> str:
+        return MaskParam.encode(self.grid.grid, self.grid.origin)
+
+    def set_value(self, value: Any) -> None:
+        v = self.spec.validate(value)
+        grid, origin = MaskParam.decode(v, self.spec.max_size)
+        self.grid.set_grid(grid, origin)
+        self._sync()
+        self.value_changed.emit(self.spec.key, v)
+
+    def _resize(self, n: int) -> None:
+        """Yeni n × n ızgara; eski hücreler merkezlenerek kopyalanır, orijin merkeze alınır."""
+        old = self.grid.grid
+        h, w = len(old), len(old[0])
+        new = [[0] * n for _ in range(n)]
+        dy, dx = (n - h) // 2, (n - w) // 2
+        for r in range(h):
+            for c in range(w):
+                if 0 <= r + dy < n and 0 <= c + dx < n:
+                    new[r + dy][c + dx] = old[r][c]
+        if not any(any(row) for row in new):
+            new[n // 2][n // 2] = 1
+        self.set_value(MaskParam.encode(new, (n // 2, n // 2)))
+
+    def _emit(self) -> None:
+        self._sync()
+        self.value_changed.emit(self.spec.key, self.value())
+
+    def _sync(self) -> None:
+        g = self.grid.grid
+        n = len(g)
+        for k, b in self.size_buttons.items():
+            b.setChecked(k == n and len(g[0]) == n)
+        r, c = self.grid.origin
+        member = "" if g[r][c] else " (not in B)"
+        self.origin_label.setText(f"origin {r},{c}{member}")
+
+    def set_accent(self, color: QColor) -> None:
+        self.grid.accent = QColor(color)
+        self.grid.update()
+
+
 def create_control(spec: ParamSpec) -> ParameterControl:
     if isinstance(spec, (IntParam, FloatParam)):
         return SliderControl(spec)
@@ -293,4 +445,6 @@ def create_control(spec: ParamSpec) -> ParameterControl:
         return ChoiceControl(spec)
     if isinstance(spec, BoolParam):
         return ToggleControl(spec)
+    if isinstance(spec, MaskParam):
+        return MaskControl(spec)
     raise TypeError(f"Desteklenmeyen parametre türü: {type(spec).__name__}")

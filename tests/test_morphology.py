@@ -722,7 +722,10 @@ def test_registry_morphology_entries():
     algos = registry.in_category("morphology")
     assert [a.key for a in algos] == ["erode", "dilate", "opening", "closing", "gradient", "hit_or_miss",
                                       "top_hat", "black_hat", "hat_correction", "boundary", "hole_filling",
-                                      "connected_components"]
+                                      "connected_components",
+                                      "convex_hull", "thinning", "thickening",
+                                      "skeletonization", "pruning",
+                                      "gray_erosion", "gray_dilation", "gray_opening", "gray_closing", "gray_gradient"]
     assert all(a.implemented and a.summary for a in algos)
     se_keys = ["binarize", "thresh", "foreground", "shape", "width", "height", "anchor_x", "anchor_y"]
     for a in algos[:5]:

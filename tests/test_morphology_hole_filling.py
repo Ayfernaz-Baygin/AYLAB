@@ -450,7 +450,7 @@ def test_masks_must_be_2d():
 def test_registry_entry():
     registry = build_registry()
     keys = [a.key for a in registry.in_category("morphology")]
-    assert keys[10] == "hole_filling" and len(keys) == 12 and len(registry.categories()) == 7
+    assert keys[10] == "hole_filling" and len(keys) == 22 and len(registry.categories()) == 7
     algo = registry.get("hole_filling")
     assert algo.title == "Hole Filling" and algo.implemented
     assert "X_k = (X_k−1 ⊕ B) ∩ Aᶜ" in algo.summary and "X_k ∪ A" in algo.summary

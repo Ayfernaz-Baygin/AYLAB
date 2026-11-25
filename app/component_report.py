@@ -95,7 +95,8 @@ class ComponentReportView(QWidget):
         self.report = report
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
-        if report is None:
+        if not isinstance(report, ComponentReport):   # başka rapor türleri yalnızca durum çubuğunda özetlenir
+            self.report = None
             self.hide()
             return
         self.count_label.setText(report.summary())

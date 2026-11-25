@@ -59,7 +59,10 @@ CASES = [
 
 def test_morphology_category_lists_six_operations(window):
     window.navigator.tiles["morphology"].click()
-    assert list(window.navigator.operation_rows) == KEYS + HAT_KEYS + ["boundary", "hole_filling", "connected_components"]  # Aşama 3–5
+    assert list(window.navigator.operation_rows) == KEYS + HAT_KEYS + ["boundary", "hole_filling", "connected_components",
+                                                                      "convex_hull", "thinning", "thickening",
+                                                                      "skeletonization", "pruning",
+                                                                      "gray_erosion", "gray_dilation", "gray_opening", "gray_closing", "gray_gradient"]  # Aşama 3–8
     titles = [window.navigator.operation_rows[k].algorithm.title for k in KEYS]
     assert titles == ["Erosion", "Dilation", "Opening", "Closing", "Morphological Gradient", "Hit-or-Miss Transform"]
     category = window.registry.category("morphology")

@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from app import theme
 from app.analysis_panel import AnalysisPanel
 from app.component_report import ComponentReportView
-from app.controls import ParameterControl, ToggleControl, create_control
+from app.controls import ParameterControl, create_control
 from processing.registry import Algorithm, Category
 
 
@@ -174,7 +174,7 @@ class ParameterPanel(QScrollArea):
         self._surface.accent = QColor(color)
         self._surface.update()
         for c in self.controls.values():
-            if isinstance(c, ToggleControl):
+            if hasattr(c, "set_accent"):      # anahtar ve SE ızgarası vurgu rengini izler
                 c.set_accent(color)
 
     def set_category(self, category: Category | None) -> None:

@@ -345,7 +345,9 @@ def test_registry_entry():
     registry = build_registry()
     keys = [a.key for a in registry.in_category("morphology")]
     assert keys == ["erode", "dilate", "opening", "closing", "gradient", "hit_or_miss",
-                    "top_hat", "black_hat", "hat_correction", "boundary", "hole_filling", "connected_components"]
+                    "top_hat", "black_hat", "hat_correction", "boundary", "hole_filling", "connected_components",
+                    "convex_hull", "thinning", "thickening", "skeletonization", "pruning",
+                    "gray_erosion", "gray_dilation", "gray_opening", "gray_closing", "gray_gradient"]
     algo = registry.get("boundary")
     assert algo.title == "Boundary Extraction" and algo.implemented
     assert algo.summary.startswith("Extracts object boundaries by subtracting the eroded foreground "

@@ -1,7 +1,13 @@
 """Morfolojik işlemler — Gonzalez & Woods / COMP 4360 Chapter 4.
 
-İkili işlemler (erosion, dilation, opening, closing, gradient, hit-or-miss) ve
-gri ton top-hat / black-hat (dosyanın sonundaki bölüm; eşikleme yapılmaz).
+Desteklenen işlem grupları:
+
+* İkili temel işlemler — erosion, dilation, opening, closing, gradient, hit-or-miss.
+* İkili morfolojik algoritmalar — boundary extraction, hole filling, connected
+  components, convex hull, thinning, thickening, skeletonization, pruning.
+* Gri ton morfoloji (düz SE, eşikleme yapılmaz) — erosion, dilation, opening,
+  closing, morfolojik gradient; top-hat, black-hat ve aydınlatma düzeltmesi
+  (dosyanın sonundaki bölümler; sınır kuralı orada ayrıca açıklanır).
 
 Görüntü bir küme olarak ele alınır: A = { (x, y) | f(x, y) = ön plan }.
 Yapı elemanı (SE) B, köşe/merkez fark etmeksizin seçilebilen bir orijine
@@ -16,7 +22,7 @@ Yapı elemanı (SE) B, köşe/merkez fark etmeksizin seçilebilen bir orijine
 
 Uygulama kuralları
 ------------------
-* **Sınır:** görüntünün dışındaki pikseller *arka plandır* (dersin laboratuvar
+* **Sınır (ikili işlemler):** görüntünün dışındaki pikseller *arka plandır* (dersin laboratuvar
   sayfasındaki kural). İşlemler, görüntü SE'nin etki alanı kadar arka planla
   genişletilmiş bir tuvalde yapılıp sonra kırpılır. Böylece sonuç, sonsuz
   düzlemde aynı tanımın birebir kırpılmış halidir: closing kapsayıcıdır
@@ -52,7 +58,7 @@ from processing.common import (
     split_alpha,
 )
 from processing.filters import validate_ksize
-from processing.registry import AlgorithmParameterError, ProcessResult
+from processing.registry import AlgorithmParameterError, MaskParam, ProcessResult
 
 SE_SHAPES = ("rect", "ellipse", "cross")
 BINARIZE_MODES = ("otsu", "manual")
@@ -513,6 +519,368 @@ def colorize_labels(labels: np.ndarray) -> np.ndarray:
     return label_colors(n)[labels]
 
 
+# --------------------------------------------------------------------------
+# Convex hull, thinning, thickening — slayt 63–71 (Gonzalez Şekil 9.21, 9.23, 9.24)
+# --------------------------------------------------------------------------
+
+# Şekil 9.21 — convex hull için B¹…B⁴ (merkez arka plan olmalı; bir yan sütun/satır ön plan)
+HULL_KERNELS = tuple(np.array(k) for k in (
+    [[1, 0, 0], [1, -1, 0], [1, 0, 0]],
+    [[1, 1, 1], [0, -1, 0], [0, 0, 0]],
+    [[0, 0, 1], [0, -1, 1], [0, 0, 1]],
+    [[0, 0, 0], [0, -1, 0], [1, 1, 1]],
+))
+# Şekil 9.23 — thinning için B¹…B⁸ (1 = ön plan, −1 = arka plan, 0 = önemsiz)
+THIN_KERNELS = tuple(np.array(k) for k in (
+    [[-1, -1, -1], [0, 1, 0], [1, 1, 1]],
+    [[0, -1, -1], [1, 1, -1], [1, 1, 0]],
+    [[1, 0, -1], [1, 1, -1], [1, 0, -1]],
+    [[1, 1, 0], [1, 1, -1], [0, -1, -1]],
+    [[1, 1, 1], [0, 1, 0], [-1, -1, -1]],
+    [[0, 1, 1], [-1, 1, 1], [-1, -1, 0]],
+    [[-1, 0, 1], [-1, 1, 1], [-1, 0, 1]],
+    [[-1, -1, 0], [-1, 1, 1], [0, 1, 1]],
+))
+HULL_METHODS = ("contour", "morph")
+HULL_DISPLAYS = ("filled", "overlay")
+THIN_METHODS = ("hmt", "zhang_suen")
+THICKEN_CLEANUP = ("remove", "keep")
+
+
+@dataclass(frozen=True)
+class IterationReport:
+    """Yinelemeli işlemin özeti (durum çubuğunda gösterilir)."""
+
+    operation: str
+    cycles: int          # tamamlanan tam döngü sayısı (son, değişiklik olmayan kontrol dahil)
+    converged: bool      # X artık değişmiyor mu (aksi halde döngü sınırında durdu)
+    before: int          # ön plan piksel sayısı, önce / sonra
+    after: int
+
+    def summary(self) -> str:
+        state = f"converged after {self.cycles} cycle{'s' if self.cycles != 1 else ''}" if self.converged \
+            else f"stopped at the {self.cycles}-cycle limit (not converged)"
+        return f"{self.operation}: {state}, foreground {self.before} → {self.after} px"
+
+
+@dataclass(frozen=True)
+class HullReport:
+    objects: int
+    object_area: int
+    hull_area: int
+
+    def summary(self) -> str:
+        solidity = self.object_area / self.hull_area if self.hull_area else 0.0
+        return (f"{self.objects} object{'s' if self.objects != 1 else ''}, convex hull {self.hull_area} px "
+                f"(solidity {solidity:.2f})")
+
+
+def _validate_cycles(max_cycles) -> int:
+    n = _validate_int(max_cycles, "Max cycles")
+    if n < 0:
+        raise AlgorithmParameterError(f"Max cycles must be ≥ 0 (0 = until convergence) (got {n}).")
+    return n
+
+
+def _fill_convex_polygon(vertices: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Merkezi kapalı dışbükey poligonun içinde/üstünde olan pikseller (tam sayı aritmetiği, kesin).
+
+    ``fillPoly`` yerine yarı düzlem testi: kenar üzerindeki merkezler de dahildir;
+    1 köşe → tek piksel, 2 köşe → doğru parçası üzerindeki pikseller.
+    """
+    v = np.asarray(vertices, np.int64).reshape(-1, 2)
+    out = np.zeros(shape, bool)
+    x0, y0 = v.min(axis=0)
+    x1, y1 = v.max(axis=0)
+    ys, xs = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+    nxt = np.roll(v, -1, axis=0)
+    area2 = int(np.sum(v[:, 0] * nxt[:, 1] - nxt[:, 0] * v[:, 1]))     # 2 × işaretli alan (shoelace)
+    if area2 != 0:
+        sign = 1 if area2 > 0 else -1
+        inside = np.ones(xs.shape, bool)
+        for (ax, ay), (bx, by) in zip(v, nxt):
+            inside &= sign * ((bx - ax) * (ys - ay) - (by - ay) * (xs - ax)) >= 0
+    else:                                   # tek nokta ya da doğrusal köşeler → doğru parçası
+        order = np.lexsort((v[:, 1], v[:, 0]))
+        (ax, ay), (bx, by) = v[order[0]], v[order[-1]]
+        inside = (((bx - ax) * (ys - ay) - (by - ay) * (xs - ax)) == 0) \
+            & (xs >= min(ax, bx)) & (xs <= max(ax, bx)) & (ys >= min(ay, by)) & (ys <= max(ay, by))
+    out[y0:y1 + 1, x0:x1 + 1] = inside
+    return out
+
+
+def convex_hull_mask(mask: np.ndarray, method: str = "contour") -> tuple[np.ndarray, list[np.ndarray], int]:
+    """Her nesnenin dışbükey zarfı; döndürür: (zarfların birleşimi ∪ A, zarf köşe listeleri, nesne sayısı).
+
+    contour — slayt 65: ``findContours(RETR_EXTERNAL)`` ile DIŞ konturlar (delikler zarfı
+              etkilemez), ``convexHull`` ile köşeler; zarf, merkezi poligonda olan piksellerdir.
+    morph   — Şekil 9.21: her nesne için X_kⁱ = (X_{k−1}ⁱ ⊛ Bⁱ) ∪ X_{k−1}ⁱ, i = 1…4, yakınsayana dek;
+              C(A) = ∪ Dⁱ. Büyüme nesnenin sınırlayıcı kutusuyla sınırlıdır (ders kitabının önerisi).
+              Sonuç, gerçek dışbükey zarfın 4 yönlü dijital yaklaşımıdır (köşeler kutuya doğru dolar).
+    """
+    a = _validate_mask(mask)
+    if method not in HULL_METHODS:
+        raise AlgorithmParameterError(f"Hull method must be 'contour' or 'morph' (got {method!r}).")
+    out = a.copy()
+    hulls: list[np.ndarray] = []
+    if method == "contour":
+        contours, _ = cv2.findContours(a.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            hull = cv2.convexHull(c).reshape(-1, 2)
+            hulls.append(hull)
+            out |= _fill_convex_polygon(hull, a.shape)
+        return out, hulls, len(contours)
+    report = label_components(a, 8)
+    for comp in report.components:
+        ys, xs = slice(comp.y, comp.y + comp.height), slice(comp.x, comp.x + comp.width)
+        obj = report.labels[ys, xs] == comp.label
+        hull = np.zeros_like(obj)
+        for k in HULL_KERNELS:
+            x = obj.copy()
+            for _ in range(obj.size + 1):
+                nxt = x | hit_or_miss_mask(x, k)
+                if np.array_equal(nxt, x):
+                    break
+                x = nxt
+            hull |= x
+        out[ys, xs] |= hull
+    return out, hulls, report.count
+
+
+def thin_mask(mask: np.ndarray, method: str = "hmt", max_cycles: int = 0) -> tuple[np.ndarray, IterationReport]:
+    """Thinning, yakınsayana kadar (``max_cycles`` = 0) ya da en fazla ``max_cycles`` döngü.
+
+    hmt        — Şekil 9.23: A ⊗ B = A − (A ⊛ B); bir döngü B¹…B⁸'i SIRAYLA uygular
+                 ({A ⊗ B} = ((…(A ⊗ B¹) ⊗ B²) …) ⊗ B⁸); hiçbir piksel silinmeyince durur.
+    zhang_suen — slayt 68: iki alt-adımlı paralel inceltme (Zhang & Suen, 1984).
+    Her değişen döngü en az bir piksel sildiğinden yakınsama en fazla |A| + 1 döngüde garantidir;
+    güvenlik sınırı olarak bu değer kullanılır.
+    """
+    a = _validate_mask(mask)
+    if method not in THIN_METHODS:
+        raise AlgorithmParameterError(f"Thinning method must be 'hmt' or 'zhang_suen' (got {method!r}).")
+    limit = _validate_cycles(max_cycles) or int(a.sum()) + 1
+    x, cycles, changed = a.copy(), 0, True
+    while cycles < limit and changed:
+        changed = False
+        if method == "hmt":
+            for k in THIN_KERNELS:
+                hits = hit_or_miss_mask(x, k)
+                if hits.any():
+                    x &= ~hits
+                    changed = True
+        else:
+            for step in (1, 2):
+                delete = _zhang_suen_candidates(x, step)
+                if delete.any():
+                    x &= ~delete
+                    changed = True
+        cycles += 1
+    name = "Thinning (hit-or-miss B¹…B⁸)" if method == "hmt" else "Thinning (Zhang–Suen)"
+    return x, IterationReport(name, cycles, not changed, int(a.sum()), int(x.sum()))
+
+
+def _zhang_suen_candidates(x: np.ndarray, step: int) -> np.ndarray:
+    """Zhang–Suen alt-adımında silinecek pikseller. Komşular P2…P9: kuzeyden saat yönünde; dışarısı 0."""
+    p = np.pad(x, 1).astype(np.uint8)
+    h, w = x.shape
+    n = [p[0:h, 1:w + 1], p[0:h, 2:w + 2], p[1:h + 1, 2:w + 2], p[2:h + 2, 2:w + 2],
+         p[2:h + 2, 1:w + 1], p[2:h + 2, 0:w], p[1:h + 1, 0:w], p[0:h, 0:w]]          # P2 … P9
+    b = sum(v.astype(np.int16) for v in n)
+    a = sum(((n[i] == 0) & (n[(i + 1) % 8] == 1)).astype(np.int16) for i in range(8))
+    p2, p4, p6, p8 = n[0], n[2], n[4], n[6]
+    if step == 1:
+        c3, c4 = (p2 * p4 * p6) == 0, (p4 * p6 * p8) == 0
+    else:
+        c3, c4 = (p2 * p4 * p8) == 0, (p2 * p6 * p8) == 0
+    return x & (b >= 2) & (b <= 6) & (a == 1) & c3 & c4
+
+
+def thicken_mask(mask: np.ndarray, max_cycles: int = 0, cleanup: str = "remove") -> tuple[np.ndarray, IterationReport]:
+    """Thickening, Şekil 9.24 / laboratuvar ``thicken``: arka planı incelt, tümleyenini al.
+
+    T = (Aᶜ ⊗ {B})ᶜ — arka plan (B¹…B⁸ ile) inceltildikçe nesneler büyür; yakınsadığında
+    nesneler, arka planın iskeletine kadar kalınlaşır (komşu nesneler birleşmez: aradaki
+    iskelet arka plan kalır). ``cleanup="remove"``: T'nin A'ya değmeyen (8-bağlantılı)
+    kopuk parçaları silinir — ders kitabının önerdiği son adım. ``max_cycles`` kalınlaşma
+    miktarını sınırlar (0 = yakınsayana kadar; büyük görüntüde yavaş olabilir).
+
+    Görüntü sınırı: projenin genel kuralı "görüntü dışı arka plandır". Aᶜ bu yüzden 1 piksellik,
+    DEĞİŞMEYEN bir arka plan dolgusuyla (değer 1) genişletilir; yalnızca görüntü içindeki pikseller
+    inceltilebilir. (Dışarısı 0 sayılırsa görüntü çerçevesi bir nesne gibi büyür ve kenara değen
+    ayrı nesneleri bu şerit üzerinden birleştirebilir.) Böylece silinen her arka plan pikseli o anki
+    bir nesne pikseline komşudur; ``remove`` yine uygulanır ama A boş değilse silecek parça kalmaz.
+    """
+    a = _validate_mask(mask)
+    if cleanup not in THICKEN_CLEANUP:
+        raise AlgorithmParameterError(f"Cleanup must be 'remove' or 'keep' (got {cleanup!r}).")
+    c = np.pad(~a, 1, constant_values=True)            # Aᶜ + sabit arka plan dolgusu
+    inner = np.zeros_like(c)
+    inner[1:-1, 1:-1] = True
+    limit = _validate_cycles(max_cycles) or int(c[inner].sum()) + 1
+    cycles, changed = 0, True
+    while cycles < limit and changed:                  # Şekil 9.23 inceltmesi: B¹…B⁸ sırayla
+        changed = False
+        for k in THIN_KERNELS:
+            hits = hit_or_miss_mask(c, k) & inner      # dolgu pikselleri silinmez
+            if hits.any():
+                c &= ~hits
+                changed = True
+        cycles += 1
+    t = ~c[1:-1, 1:-1]
+    if cleanup == "remove":
+        labels = label_components(t, 8).labels
+        keep = np.unique(labels[a & (labels > 0)])
+        t = np.isin(labels, keep) & (labels > 0)
+    return t, IterationReport("Thickening (background thinning)", cycles, not changed, int(a.sum()), int(t.sum()))
+
+
+# --------------------------------------------------------------------------
+# Skeletonization ve pruning — slayt 72–81 (Gonzalez Şekil 9.26, 9.27)
+# --------------------------------------------------------------------------
+
+# Şekil 9.27(b) — uç nokta çekirdekleri B¹…B⁸ (laboratuvardaki ENDPT ile aynı; 1 / −1 / 0 = önemsiz).
+# B¹…B⁴: tek komşu bir kenar komşusu (köşeleri önemsiz); B⁵…B⁸: tek komşu bir köşegen komşu.
+PRUNE_KERNELS = tuple(np.array(k) for k in (
+    [[0, -1, -1], [1, 1, -1], [0, -1, -1]],
+    [[0, 1, 0], [-1, 1, -1], [-1, -1, -1]],
+    [[-1, -1, 0], [-1, 1, 1], [-1, -1, 0]],
+    [[-1, -1, -1], [-1, 1, -1], [0, 1, 0]],
+    [[1, -1, -1], [-1, 1, -1], [-1, -1, -1]],
+    [[-1, -1, 1], [-1, 1, -1], [-1, -1, -1]],
+    [[-1, -1, -1], [-1, 1, -1], [-1, -1, 1]],
+    [[-1, -1, -1], [-1, 1, -1], [1, -1, -1]],
+))
+SKELETON_DISPLAYS = ("skeleton", "levels", "layer", "reconstruction")
+PRUNE_DISPLAYS = ("result", "overlay", "x1", "x2", "x3")
+
+
+@dataclass(frozen=True)
+class SkeletonLevel:
+    k: int
+    eroded: int          # |A ⊖ kB|
+    opened: int          # |(A ⊖ kB) ∘ B|
+    skeleton: int        # |S_k(A)|
+
+
+@dataclass(frozen=True)
+class SkeletonReport:
+    """Morfolojik iskeletin seviye seviye özeti (durum çubuğunda gösterilir)."""
+
+    se: str
+    levels: tuple[SkeletonLevel, ...]   # k = 0…K (A boşsa boş)
+    object_px: int
+    skeleton_px: int
+    components: int                     # S(A)'nın 8-bağlantılı bileşen sayısı
+    reconstructed: bool                 # ⋃ (S_k ⊕ kB) == A
+    shown: str = ""                     # gösterilen katman ("layer" gösteriminde)
+
+    @property
+    def K(self) -> int:
+        return len(self.levels) - 1
+
+    def summary(self) -> str:
+        if not self.levels:
+            return f"Skeleton ({self.se}): A is empty — S(A) = ∅"
+        # önemli bilgiler önce (durum çubuğu uzun metni sondan kırpar); seviye listesi en sonda
+        sk = ", ".join(str(lv.skeleton) for lv in self.levels)
+        return (f"Skeleton ({self.se}): K = {self.K}, |S(A)| = {self.skeleton_px} of {self.object_px} px, "
+                f"{self.components} part{'s' if self.components != 1 else ''}, "
+                f"reconstruction {'= A ✓' if self.reconstructed else '≠ A ✗'}{self.shown}; |S_k| k=0…{self.K}: {sk}")
+
+
+@dataclass(frozen=True)
+class PruneReport:
+    n: int
+    thinning_cycles: int    # X1 için tamamlanan döngü (değişiklik kalmazsa n'den önce durur)
+    a_px: int
+    x1_px: int
+    end_points: int         # |X2|
+    x3_px: int
+    x4_px: int
+
+    def summary(self) -> str:
+        return (f"Pruning n = {self.n}: X1 = A ⊗ {{B}} ({self.thinning_cycles} cycle"
+                f"{'s' if self.thinning_cycles != 1 else ''}) {self.a_px} → {self.x1_px} px; "
+                f"X2 = {self.end_points} end point{'s' if self.end_points != 1 else ''}; X3 {self.x3_px} px; "
+                f"X4 = X1 ∪ X3 {self.x4_px} px; removed {self.a_px - self.x4_px} px")
+
+
+def _require_eroding_se(se: StructuringElement) -> StructuringElement:
+    """1×1 SE (yalnızca orijin) reddedilir: A ⊖ B = A olur, K tanımsızdır (erosion hiç bitmez)."""
+    if se.mask.sum() == 1:
+        raise AlgorithmParameterError("Skeleton SE must have more than one cell (a 1 × 1 SE never erodes A).")
+    return se
+
+
+def _skeleton_se(shape: str, width: int, height: int) -> StructuringElement:
+    """İskelet SE'si: orijin her zaman merkezde (B orijini içerir → A ⊖ kB ⊆ A, ⋃ (S_k ⊕ kB) ⊆ A)."""
+    return _require_eroding_se(structuring_element(shape, width, height))
+
+
+def skeleton_levels(mask: np.ndarray, se: StructuringElement) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Her k = 0…K için (A ⊖ kB, (A ⊖ kB) ∘ B, S_k(A)); K = max{k | A ⊖ kB ≠ ∅}.
+
+    S_k(A) = (A ⊖ kB) − (A ⊖ kB) ∘ B; A ⊖ kB, B ile k kez art arda erosion'dur. A boşsa liste boştur.
+    Her erosion en az bir pikseli siler (B orijini içerir, A sonlu), bu yüzden döngü en fazla |A| adımdır.
+    """
+    a = _validate_mask(mask)
+    _require_eroding_se(se)
+    out = []
+    e = a
+    while e.any():
+        o = binary_opening(e, se)
+        out.append((e, o, e & ~o))
+        e = binary_erosion(e, se)
+    return out
+
+
+def skeleton_reconstruct(layers, se: StructuringElement) -> np.ndarray:
+    """A = ⋃_{k=0…K} (S_k(A) ⊕ kB) — S_k, B ile k kez art arda dilation."""
+    if not layers:
+        raise AlgorithmParameterError("Reconstruction needs at least one skeleton level.")
+    out = np.zeros(layers[0][2].shape, bool)
+    for k, (_, _, s) in enumerate(layers):
+        out |= binary_dilation(s, se, k) if k else s
+    return out
+
+
+def prune_mask(mask: np.ndarray, n: int = 3) -> tuple[dict[str, np.ndarray], PruneReport]:
+    """Pruning (Şekil 9.27 / laboratuvar ``prune``), dört adım:
+
+    X1 = A ⊗ {B}              — uç nokta çekirdekleri B¹…B⁸ ile SIRALI inceltme, n döngü
+                                (bir döngüde değişiklik olmazsa erken durur);
+    X2 = ⋃_{k=1…8} (X1 ⊛ Bᵏ)  — X1'in uç noktaları;
+    X3 = (X2 ⊕ H) ∩ A         — H = 3×3 kare, n kez (A ile koşullu dilation);
+    X4 = X1 ∪ X3.
+    """
+    a = _validate_mask(mask)
+    n = _validate_int(n, "Spur length n")
+    if n < 1:
+        raise AlgorithmParameterError(f"Spur length n must be ≥ 1 (got {n}).")
+    x1, cycles = a.copy(), 0
+    while cycles < n:
+        changed = False
+        for k in PRUNE_KERNELS:
+            hits = hit_or_miss_mask(x1, k)
+            if hits.any():
+                x1 &= ~hits
+                changed = True
+        cycles += 1
+        if not changed:
+            break
+    x2 = np.zeros_like(a)
+    for k in PRUNE_KERNELS:
+        x2 |= hit_or_miss_mask(x1, k)
+    h = structuring_element("rect", 3, 3)
+    x3 = x2.copy()
+    for _ in range(n):
+        x3 = binary_dilation(x3, h) & a
+    x4 = x1 | x3
+    report = PruneReport(n, cycles, int(a.sum()), int(x1.sum()), int(x2.sum()), int(x3.sum()), int(x4.sum()))
+    return {"A": a, "X1": x1, "X2": x2, "X3": x3, "X4": x4}, report
+
+
 BOX_MIN_SIZE = 3   # bu boyuttan küçük bileşenlere kutu/merkez çizilmez (rengi örtülmesin)
 
 
@@ -692,6 +1060,128 @@ def hat_correction(image: np.ndarray, shape: str = "rect", width: int = 15, heig
 
 
 # --------------------------------------------------------------------------
+# Gri seviye erosion / dilation / opening / closing / gradient — slayt 82–85
+# (Gonzalez Şekil 9.37, 9.39, 9.41; laboratuvar gErode, gDilate, gOpen, gClose, gGradient)
+# --------------------------------------------------------------------------
+#
+# Yukarıdaki gray_erosion / gray_dilation (Top-hat ile ortak) aynen kullanılır: düz SE,
+# erosion min f(z + s), dilation max f(z − s) (B̂), görüntü dışı YOK SAYILIR (laboratuvar
+# gWindow). İkili morfolojideki "dışarısı arka plan" kuralı burada uygulanmaz.
+# SE seçenekleri laboratuvarın SEPicker'ı ile aynıdır: rect, cross, ellipse (cv2 elipsi),
+# hline (1 × n), vline (n × 1), custom (hücreler + orijin). Laboratuvar boyutları 3 ve 5.
+
+GRAY_SE_SHAPES = ("rect", "cross", "ellipse", "hline", "vline", "custom")
+GRAY_OPEN_DISPLAYS = ("opening", "erosion")
+GRAY_CLOSE_DISPLAYS = ("closing", "dilation")
+GRAY_GRADIENT_DISPLAYS = ("gradient", "dilation", "erosion")
+DEFAULT_CUSTOM_SE = "010/011/000@1,1"   # asimetrik: merkez + üst + sağ (yansıması merkez + alt + sol)
+
+
+def gray_structuring_element(shape: str = "rect", size: int = 3, custom: str = DEFAULT_CUSTOM_SE) -> StructuringElement:
+    """Laboratuvarın makeSE / özel SE'si. ``size`` tek sayı (custom'da kullanılmaz)."""
+    if shape not in GRAY_SE_SHAPES:
+        raise AlgorithmParameterError(f"SE shape must be one of {', '.join(GRAY_SE_SHAPES)} (got {shape!r}).")
+    if shape == "custom":
+        parsed = MaskParam.decode(custom, 31)
+        if parsed is None:
+            raise AlgorithmParameterError(f"Custom SE must look like '010/011/000@1,1' with at least one cell (got {custom!r}).")
+        grid, (r, c) = parsed
+        return StructuringElement(np.array(grid, np.uint8), (c, r))
+    n = validate_ksize(size, name="SE size")
+    if shape == "hline":
+        return StructuringElement(np.ones((1, n), np.uint8), (n // 2, 0))
+    if shape == "vline":
+        return StructuringElement(np.ones((n, 1), np.uint8), (0, n // 2))
+    return structuring_element(shape, n, n)
+
+
+def gray_gradient(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    """g = (f ⊕ b) − (f ⊖ b), laboratuvardaki gSub gibi 0'da kırpılır (orijin B'de ise zaten ≥ 0)."""
+    return np.clip(gray_dilation(f, se).astype(np.int16) - gray_erosion(f, se).astype(np.int16), 0, 255).astype(np.uint8)
+
+
+@dataclass(frozen=True)
+class GrayReport:
+    """Gri seviye işlemin özeti: SE ve giriş/çıkış yoğunluk istatistikleri."""
+
+    operation: str
+    se: str
+    before: tuple[float, int, int]      # (ortalama, min, maks)
+    after: tuple[float, int, int]
+    extra: str = ""
+
+    def summary(self) -> str:
+        (m0, a0, b0), (m1, a1, b1) = self.before, self.after
+        return (f"{self.operation} ({self.se}): mean {m0:.1f} → {m1:.1f}, range {a0}–{b0} → {a1}–{b1}"
+                f"{self.extra}")
+
+
+def _stats(x: np.ndarray) -> tuple[float, int, int]:
+    return float(x.mean()), int(x.min()), int(x.max())
+
+
+def _se_text(shape: str, se: StructuringElement) -> str:
+    h, w = se.mask.shape
+    ax, ay = se.anchor
+    return f"{shape} {w}×{h}" + ("" if shape != "custom" else f", origin r{ay} c{ax}")
+
+
+def _gray_apply(image, shape, size, custom, name, fn, extra_fn=None) -> ProcessResult:
+    se = gray_structuring_element(shape, size, custom)
+    f = intensity_channel(image)
+    out = fn(f, se)
+    extra = extra_fn(f, se) if extra_fn else ""
+    return ProcessResult(match_layout(out, image), GrayReport(name, _se_text(shape, se), _stats(f), _stats(out), extra))
+
+
+def grayscale_erosion(image: np.ndarray, shape: str = "rect", size: int = 3,
+                      custom: str = DEFAULT_CUSTOM_SE) -> ProcessResult:
+    """[f ⊖ b](x, y) = min f(x + s, y + t), (s, t) ∈ b — eşikleme yok; renkli girdide parlaklık Y."""
+    return _gray_apply(image, shape, size, custom, "Grayscale erosion", gray_erosion)
+
+
+def grayscale_dilation(image: np.ndarray, shape: str = "rect", size: int = 3,
+                       custom: str = DEFAULT_CUSTOM_SE) -> ProcessResult:
+    """[f ⊕ b](x, y) = max f(x − s, y − t), (s, t) ∈ b (yansıtılmış SE)."""
+    return _gray_apply(image, shape, size, custom, "Grayscale dilation", gray_dilation)
+
+
+def grayscale_opening(image: np.ndarray, shape: str = "rect", size: int = 3, custom: str = DEFAULT_CUSTOM_SE,
+                      display: str = "opening") -> ProcessResult:
+    """f ∘ b = (f ⊖ b) ⊕ b. ``display="erosion"``: 1. aşama f ⊖ b."""
+    if display not in GRAY_OPEN_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be 'opening' or 'erosion' (got {display!r}).")
+    if display == "erosion":
+        return _gray_apply(image, shape, size, custom, "Grayscale opening · stage 1 f ⊖ b", gray_erosion)
+    return _gray_apply(image, shape, size, custom, "Grayscale opening", gray_opening)
+
+
+def grayscale_closing(image: np.ndarray, shape: str = "rect", size: int = 3, custom: str = DEFAULT_CUSTOM_SE,
+                      display: str = "closing") -> ProcessResult:
+    """f • b = (f ⊕ b) ⊖ b. ``display="dilation"``: 1. aşama f ⊕ b."""
+    if display not in GRAY_CLOSE_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be 'closing' or 'dilation' (got {display!r}).")
+    if display == "dilation":
+        return _gray_apply(image, shape, size, custom, "Grayscale closing · stage 1 f ⊕ b", gray_dilation)
+    return _gray_apply(image, shape, size, custom, "Grayscale closing", gray_closing)
+
+
+def grayscale_gradient(image: np.ndarray, shape: str = "rect", size: int = 3, custom: str = DEFAULT_CUSTOM_SE,
+                       display: str = "gradient") -> ProcessResult:
+    """g = (f ⊕ b) − (f ⊖ b). ``display``: gradient | dilation (f ⊕ b) | erosion (f ⊖ b)."""
+    if display not in GRAY_GRADIENT_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be one of {', '.join(GRAY_GRADIENT_DISPLAYS)} (got {display!r}).")
+
+    def parts(f, se):
+        d, e = gray_dilation(f, se), gray_erosion(f, se)
+        return f"; f ⊕ b mean {d.mean():.1f}, f ⊖ b mean {e.mean():.1f}"
+    fn = {"gradient": gray_gradient, "dilation": gray_dilation, "erosion": gray_erosion}[display]
+    name = {"gradient": "Grayscale gradient", "dilation": "Grayscale gradient · f ⊕ b",
+            "erosion": "Grayscale gradient · f ⊖ b"}[display]
+    return _gray_apply(image, shape, size, custom, name, fn, parts)
+
+
+# --------------------------------------------------------------------------
 # Kayıtlı işlevler (AYLAB parametre paneliyle aynı imzalar)
 # --------------------------------------------------------------------------
 
@@ -787,6 +1277,134 @@ def connected_components(image: np.ndarray, binarize: str = "otsu", thresh: int 
         color = draw_component_boxes(color, report)
     _, alpha = split_alpha(image)
     return ProcessResult(merge_alpha(color, alpha), report)
+
+
+HULL_COLORS = {  # BGR — overlay gösterimi
+    "object": (200, 200, 200),     # A: açık gri
+    "added": (120, 85, 20),        # zarfın eklediği alan (C(A) − A): koyu mavi-camgöbeği
+    "contour": (90, 220, 90),      # nesnenin dış konturu: yeşil
+    "hull": (0, 215, 255),         # zarfın sınırı: sarı
+}
+
+
+def convex_hull(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+                method: str = "contour", display: str = "filled") -> ProcessResult:
+    """Her nesnenin dışbükey zarfı. ``filled``: C(A) ∪ A ikili (0/255);
+    ``overlay``: renkli — nesne gri, zarfın eklediği alan mavi, dış kontur yeşil, zarf sınırı sarı."""
+    if display not in HULL_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be 'filled' or 'overlay' (got {display!r}).")
+    a = to_binary(image, binarize, thresh, foreground)
+    hull, _, objects = convex_hull_mask(a, method)
+    report = HullReport(objects, int(a.sum()), int(hull.sum()))
+    if display == "filled":
+        return ProcessResult(_to_output(hull, image), report)
+    color = np.zeros(a.shape + (3,), np.uint8)
+    color[hull & ~a] = HULL_COLORS["added"]
+    color[a] = HULL_COLORS["object"]
+    contours, _ = cv2.findContours(a.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cv2.drawContours(color, contours, -1, HULL_COLORS["contour"], 1)
+    color[boundary_mask(hull, structuring_element("cross", 3, 3))] = HULL_COLORS["hull"]
+    _, alpha = split_alpha(image)
+    return ProcessResult(merge_alpha(color, alpha), report)
+
+
+def thinning(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+             method: str = "hmt", max_cycles: int = 0) -> ProcessResult:
+    a = to_binary(image, binarize, thresh, foreground)
+    x, report = thin_mask(a, method, max_cycles)
+    return ProcessResult(_to_output(x, image), report)
+
+
+def thickening(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+               max_cycles: int = 10, cleanup: str = "remove") -> ProcessResult:
+    a = to_binary(image, binarize, thresh, foreground)
+    t, report = thicken_mask(a, max_cycles, cleanup)
+    return ProcessResult(_to_output(t, image), report)
+
+
+SKELETON_COLORS = {  # BGR — "layer" gösterimi
+    "object": (70, 70, 70),        # A: koyu gri
+    "eroded": (150, 150, 150),     # (A ⊖ kB) ∘ B: açık gri (opening'in geri getirdiği kısım)
+    "skeleton": (0, 215, 255),     # S_k(A): sarı
+}
+PRUNE_COLORS = {  # BGR — "overlay" gösterimi
+    "removed": (60, 60, 230),      # A − X4: budanan pikseller, kırmızı
+    "kept": (235, 235, 235),       # X1: inceltmeden sağ çıkan, beyaz
+    "restored": (90, 220, 90),     # X4 − X1: X3 ile geri büyütülen uçlar, yeşil
+    "end_point": (0, 215, 255),    # X2: X1'in uç noktaları, sarı
+}
+
+
+def _color_output(color: np.ndarray, image: np.ndarray) -> np.ndarray:
+    _, alpha = split_alpha(image)
+    return merge_alpha(color, alpha)
+
+
+def skeletonization(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+                    shape: str = "rect", width: int = 3, height: int = 3, display: str = "skeleton",
+                    level: int = 0) -> ProcessResult:
+    """Morfolojik iskelet S(A) = ⋃ S_k(A) (Şekil 9.26).
+
+    skeleton       — S(A), 0/255.
+    levels         — renkli: A koyu gri, S_k pikselleri k'ya göre renk (k = 0 ilk palet rengi).
+    layer          — renkli, seçilen ``level`` = k için: A koyu gri, (A ⊖ kB) ∘ B açık gri, S_k sarı
+                     (k > K ise A ⊖ kB = ∅, yalnızca A görünür).
+    reconstruction — ⋃ (S_k ⊕ kB), 0/255 (A ile aynı olmalı).
+    """
+    if display not in SKELETON_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be one of {', '.join(SKELETON_DISPLAYS)} (got {display!r}).")
+    level = _validate_int(level, "Level k")
+    if level < 0:
+        raise AlgorithmParameterError(f"Level k must be ≥ 0 (got {level}).")
+    se = _skeleton_se(shape, width, height)
+    a = to_binary(image, binarize, thresh, foreground)
+    layers = skeleton_levels(a, se)
+    skel = np.zeros_like(a)
+    for _, _, s in layers:
+        skel |= s
+    rec = skeleton_reconstruct(layers, se) if layers else np.zeros_like(a)
+    shown = ""
+    if display == "layer":
+        shown = f"; showing k = {level}" + (f": |S_{level}| = {int(layers[level][2].sum())} px" if level < len(layers)
+                                             else " (> K: A ⊖ kB = ∅)")
+    report = SkeletonReport(
+        f"{width}×{height} {shape}",
+        tuple(SkeletonLevel(k, int(e.sum()), int(o.sum()), int(s.sum())) for k, (e, o, s) in enumerate(layers)),
+        int(a.sum()), int(skel.sum()), label_components(skel, 8).count, bool(np.array_equal(rec, a)), shown)
+    if display == "skeleton":
+        return ProcessResult(_to_output(skel, image), report)
+    if display == "reconstruction":
+        return ProcessResult(_to_output(rec, image), report)
+    color = np.zeros(a.shape + (3,), np.uint8)
+    color[a] = SKELETON_COLORS["object"]
+    if display == "levels":
+        palette = label_colors(len(layers))
+        for k, (_, _, s) in enumerate(layers):
+            color[s] = palette[k + 1]
+    elif level < len(layers):
+        _, o, s = layers[level]
+        color[o] = SKELETON_COLORS["eroded"]
+        color[s] = SKELETON_COLORS["skeleton"]
+    return ProcessResult(_color_output(color, image), report)
+
+
+def pruning(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+            n: int = 3, display: str = "result") -> ProcessResult:
+    """Pruning (Şekil 9.27). ``result``: X4; ``x1`` / ``x2`` / ``x3``: ara adımlar (0/255);
+    ``overlay``: budanan kırmızı, X1 beyaz, geri büyütülen uçlar yeşil, X2 uç noktaları sarı."""
+    if display not in PRUNE_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be one of {', '.join(PRUNE_DISPLAYS)} (got {display!r}).")
+    a = to_binary(image, binarize, thresh, foreground)
+    steps, report = prune_mask(a, n)
+    if display != "overlay":
+        key = "X4" if display == "result" else display.upper()
+        return ProcessResult(_to_output(steps[key], image), report)
+    color = np.zeros(a.shape + (3,), np.uint8)
+    color[a & ~steps["X4"]] = PRUNE_COLORS["removed"]
+    color[steps["X1"]] = PRUNE_COLORS["kept"]
+    color[steps["X4"] & ~steps["X1"]] = PRUNE_COLORS["restored"]
+    color[steps["X2"]] = PRUNE_COLORS["end_point"]
+    return ProcessResult(_color_output(color, image), report)
 
 
 def hit_or_miss(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",

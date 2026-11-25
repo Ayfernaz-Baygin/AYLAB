@@ -19,6 +19,7 @@ from processing.registry import (
     ChoiceParam,
     FloatParam,
     IntParam,
+    MaskParam,
 )
 
 _INTERPOLATION = ChoiceParam(
@@ -59,6 +60,18 @@ _STRUCTURING_ELEMENT = _se_params(3)
 # Top-hat / black-hat: SE, çıkarılacak ayrıntılardan BÜYÜK olmalı (slayt 44: 40 × 40)
 _HAT_SE = _se_params(15)
 _MORPH = _BINARY_INPUT + _STRUCTURING_ELEMENT
+# Gri seviye morfoloji (slayt 82–85): laboratuvarın SE seçenekleri; boyut 3 / 5 (varsayılan 3)
+_GRAY_SE = (
+    ChoiceParam("shape", "SE shape", (("rect", "Rectangle"), ("cross", "Cross"), ("ellipse", "Ellipse"),
+                                      ("hline", "Horizontal line"), ("vline", "Vertical line"), ("custom", "Custom")),
+                "rect", help="Flat SE (the lab's options). ELLIPSE 3 × 3 equals the cross (OpenCV disk).  LINES: "
+                             "1 × n / n × 1.  CUSTOM: drawn in the grid below, with its own origin."),
+    IntParam("size", "SE size n", 3, 3, 31, odd_only=True, suffix="px",
+             help="n × n window (the lab uses 3 and 5). Ignored for CUSTOM. The origin is the centre."),
+    MaskParam("custom", "Custom SE · grid", "010/011/000@1,1", max_size=7,
+              help="CUSTOM only. Left click toggles a cell, right click moves the origin (it may lie outside "
+                   "the cells). Dilation uses the reflected SE b̂, so an asymmetric SE shifts the result."),
+)
 _ITERATIONS = IntParam("iterations", "Iterations", 1, 1, 10, help="Applies the operation n times with the same SE.")
 
 CATEGORIES: tuple[Category, ...] = (
@@ -199,7 +212,9 @@ ALGORITHMS: tuple[Algorithm, ...] = (
               "T_hat(f) = f − (f ∘ b): grayscale image minus its opening. Extracts small BRIGHT details "
               "that the opening removes (structures smaller than the SE); the slowly varying background "
               "drops to ≈ 0. Grayscale intensities are used directly — no thresholding. Values are shown "
-              "unscaled; color images use luminance Y.",
+              "unscaled; color images use luminance Y. Image border: pixels outside the image are ignored, so "
+              "a small bright detail that touches the border can survive the opening and is then NOT extracted "
+              "(top-hat ≈ 0 there).",
               _HAT_SE),
     Algorithm("black_hat", "Black-Hat", "morphology",
               "B_hat(f) = (f • b) − f: closing of the grayscale image minus the image (bottom-hat). Extracts "
@@ -248,6 +263,110 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                               help="Each label gets its own colour (background black); colours may repeat "
                                    "for many components.  BOXES also draws bounding boxes (1 px outside the "
                                    "object) and centroids for components of at least 3 × 3 px."),
+              )),
+    Algorithm("convex_hull", "Convex Hull", "morphology",
+              "The smallest convex region enclosing each object — a rubber band stretched around it (slide 63). "
+              "CONTOURS (slide 65): external contours → convex hull polygon; holes do not change the hull. "
+              "HIT-OR-MISS (Fig. 9.21): X_k = (X_k−1 ⊛ Bⁱ) ∪ X_k−1 for B¹…B⁴, C(A) = ∪ Dⁱ, limited to each "
+              "object's bounding box.",
+              _BINARY_INPUT + (
+                  ChoiceParam("method", "Method", (("contour", "Contours"), ("morph", "Hit-or-miss")), "contour",
+                              help="CONTOURS: exact convex polygon of each object (OpenCV findContours + "
+                                   "convexHull).  HIT-OR-MISS: textbook iteration with B¹…B⁴ — a digital "
+                                   "approximation that fills towards the bounding box."),
+                  ChoiceParam("display", "Display", (("filled", "Filled"), ("overlay", "Overlay")), "filled",
+                              help="FILLED: binary C(A) ∪ A.  OVERLAY: object grey, area added by the hull blue, "
+                                   "external contour green, hull boundary yellow."),
+              )),
+    Algorithm("thinning", "Thinning", "morphology",
+              "A ⊗ B = A − (A ⊛ B), applied with B¹…B⁸ in sequence and repeated until no pixel changes "
+              "(Fig. 9.23). Peels the boundary until only a thin curve near the object's middle remains. "
+              "The result is usually about one pixel wide and usually keeps the objects connected, but this is "
+              "not guaranteed: small 2 × 2 blocks can remain (both methods), and very small specks can "
+              "disappear completely (Zhang–Suen).",
+              _BINARY_INPUT + (
+                  ChoiceParam("method", "Method", (("hmt", "Hit-or-miss"), ("zhang_suen", "Zhang–Suen")), "hmt",
+                              help="HIT-OR-MISS: textbook B¹…B⁸ sequence.  ZHANG–SUEN: two-sub-step parallel "
+                                   "thinning (slide 68)."),
+                  IntParam("max_cycles", "Max cycles · 0 = converge", 0, 0, 500,
+                           help="0 runs until X no longer changes. A value n stops after n full cycles "
+                                "(useful to watch the boundary being peeled)."),
+              )),
+    Algorithm("thickening", "Thickening", "morphology",
+              "Dual of thinning (Fig. 9.24): thin the background Aᶜ with B¹…B⁸, then complement — objects grow "
+              "where the SE hits the background pattern, but neighbouring objects never merge (the "
+              "background skeleton separates them). The textbook cleanup of disconnected parts is applied but "
+              "normally finds nothing here, because outside the image counts as fixed background.",
+              _BINARY_INPUT + (
+                  IntParam("max_cycles", "Max cycles · 0 = converge", 10, 0, 500,
+                           help="Each cycle grows the objects by about one pixel. 0 runs until convergence "
+                                "(objects meet at the background skeleton) — slow on large images."),
+                  ChoiceParam("cleanup", "Disconnected parts", (("remove", "Remove"), ("keep", "Keep")), "remove",
+                              help="REMOVE (textbook post-processing): drop grown parts that do not touch any "
+                                   "original object. Outside the image counts as fixed background, so no "
+                                   "bands grow from the border and this step normally finds nothing."),
+              )),
+    Algorithm("skeletonization", "Skeletonization", "morphology",
+              "Morphological skeleton (Fig. 9.26): S_k(A) = (A ⊖ kB) − (A ⊖ kB) ∘ B for k = 0…K, "
+              "K = max{k | A ⊖ kB ≠ ∅}, S(A) = ∪ S_k(A). With the k values the shape is rebuilt exactly: "
+              "A = ∪ (S_k(A) ⊕ kB). The skeleton may be disconnected and need not be one pixel wide.",
+              _BINARY_INPUT + _STRUCTURING_ELEMENT[:3] + (
+                  ChoiceParam("display", "Display", (("skeleton", "Skeleton S(A)"), ("levels", "Levels · colour = k"),
+                                                     ("layer", "One level k"), ("reconstruction", "Reconstruction")),
+                              "skeleton",
+                              help="SKELETON: S(A) in white.  LEVELS: A dark grey, each S_k in its own colour.  "
+                                   "ONE LEVEL: A dark grey, (A ⊖ kB) ∘ B light grey, S_k yellow.  "
+                                   "RECONSTRUCTION: ∪ (S_k ⊕ kB), equal to A."),
+                  IntParam("level", "One level · k", 0, 0, 200,
+                           help="ONE LEVEL only. For k > K the eroded set is empty; the status bar lists "
+                                "K and |S_k| for every level. The SE origin is always its centre."),
+              )),
+    Algorithm("pruning", "Pruning", "morphology",
+              "Removes short spurs from a thin set (Fig. 9.27): X1 = A ⊗ {B} (n cycles with the end-point "
+              "kernels B¹…B⁸), X2 = ∪ X1 ⊛ Bᵏ (end points), X3 = (X2 ⊕ H) ∩ A n times (H = 3×3), "
+              "X4 = X1 ∪ X3. Branches of length ≤ n are removed — including short real branches.",
+              _BINARY_INPUT + (
+                  IntParam("n", "Spur length n", 3, 1, 50, suffix="px",
+                           help="Thinning cycles and regrowth steps. Spurs of up to n pixels vanish; a REAL "
+                                "branch of up to n pixels is removed as well, and a spur next to a real "
+                                "end point can partly grow back. Apply to a thin input (e.g. after Thinning)."),
+                  ChoiceParam("display", "Display", (("result", "Result X4"), ("overlay", "Overlay"), ("x1", "X1 · thinned"),
+                                                     ("x2", "X2 · end points"), ("x3", "X3 · regrown")), "result",
+                              help="OVERLAY: removed red, X1 white, tips restored by X3 green, end points X2 "
+                                   "yellow.  X1/X2/X3: intermediate sets in white."),
+              )),
+    Algorithm("gray_erosion", "Grayscale Erosion", "morphology",
+              "[f ⊖ b](x, y) = min f(x + s, y + t), (s, t) ∈ b — the image is a height surface and the flat SE "
+              "takes the MINIMUM under it. Bright details smaller than the SE shrink or vanish, dark ones grow; "
+              "the image gets darker. No thresholding (colour: luminance Y).",
+              _GRAY_SE),
+    Algorithm("gray_dilation", "Grayscale Dilation", "morphology",
+              "[f ⊕ b](x, y) = max f(x − s, y − t), (s, t) ∈ b — the MAXIMUM under the REFLECTED SE b̂. Dark "
+              "details smaller than the SE shrink or vanish, bright ones grow; the image gets brighter.",
+              _GRAY_SE),
+    Algorithm("gray_opening", "Grayscale Opening", "morphology",
+              "f ∘ b = (f ⊖ b) ⊕ b — erosion, then dilation with the same SE. Removes bright details smaller "
+              "than the SE (salt noise, thin bright lines) while keeping the overall brightness; f ∘ b ≤ f. "
+              "Image border: pixels outside the image are ignored, so the SE window is cut off there. A small "
+              "bright detail that touches the border can therefore survive the opening.",
+              _GRAY_SE + (
+                  ChoiceParam("display", "Display", (("opening", "f ∘ b"), ("erosion", "Stage 1 · f ⊖ b")), "opening",
+                              help="f ∘ b: the result.  STAGE 1: the erosion that the dilation then works on."),
+              )),
+    Algorithm("gray_closing", "Grayscale Closing", "morphology",
+              "f • b = (f ⊕ b) ⊖ b — dilation, then erosion with the same SE. Fills dark details smaller than "
+              "the SE (pepper noise, pits) while keeping the overall brightness; f • b ≥ f.",
+              _GRAY_SE + (
+                  ChoiceParam("display", "Display", (("closing", "f • b"), ("dilation", "Stage 1 · f ⊕ b")), "closing",
+                              help="f • b: the result.  STAGE 1: the dilation that the erosion then works on."),
+              )),
+    Algorithm("gray_gradient", "Grayscale Morphological Gradient", "morphology",
+              "g = (f ⊕ b) − (f ⊖ b) — local max minus local min inside the SE window: large exactly where the "
+              "intensity changes, an edge map (Fig. 9.41). Never negative when the origin is in b.",
+              _GRAY_SE + (
+                  ChoiceParam("display", "Display", (("gradient", "Gradient g"), ("dilation", "f ⊕ b"), ("erosion", "f ⊖ b")),
+                              "gradient", help="Inspect the two terms separately: g = (f ⊕ b) − (f ⊖ b). The status "
+                                               "bar lists the mean of both."),
               )),
     # 05 — Image Segmentation
     Algorithm("threshold", "Global Threshold", "segmentation", "Binary split at a fixed intensity.",
@@ -317,6 +436,16 @@ IMPLEMENTATIONS = {
     "boundary": morphology.boundary_extraction,
     "hole_filling": morphology.hole_filling,
     "connected_components": morphology.connected_components,
+    "convex_hull": morphology.convex_hull,
+    "thinning": morphology.thinning,
+    "thickening": morphology.thickening,
+    "skeletonization": morphology.skeletonization,
+    "pruning": morphology.pruning,
+    "gray_erosion": morphology.grayscale_erosion,
+    "gray_dilation": morphology.grayscale_dilation,
+    "gray_opening": morphology.grayscale_opening,
+    "gray_closing": morphology.grayscale_closing,
+    "gray_gradient": morphology.grayscale_gradient,
 }
 
 

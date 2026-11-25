@@ -392,7 +392,7 @@ def test_execute_wraps_plain_image_results():
 def test_registry_entry():
     registry = build_registry()
     keys = [a.key for a in registry.in_category("morphology")]
-    assert keys[-1] == "connected_components" and len(keys) == 12 and len(registry.categories()) == 7
+    assert keys[11] == "connected_components" and len(keys) == 22 and len(registry.categories()) == 7
     algo = registry.get("connected_components")
     assert algo.title == "Connected Components" and algo.implemented
     assert "X_k = (X_k−1 ⊕ B) ∩ A" in algo.summary and "background = 0" in algo.summary
@@ -471,7 +471,7 @@ def _apply(w, **values):
 def test_ui_listed_and_controls(loaded):
     w, _ = loaded
     w.navigator.tiles["morphology"].click()
-    assert list(w.navigator.operation_rows)[-1] == "connected_components"
+    assert list(w.navigator.operation_rows)[11] == "connected_components"  # 12. işlem (Aşama 6 ile 15)
     w.navigator.select_algorithm("connected_components")
     c = w.parameters.controls
     assert list(c) == ["binarize", "thresh", "foreground", "connectivity", "display"]

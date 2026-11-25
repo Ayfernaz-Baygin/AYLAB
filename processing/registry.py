@@ -115,7 +115,57 @@ class BoolParam:
         return self.default if value is None else bool(value)
 
 
-ParamSpec = Union[IntParam, FloatParam, ChoiceParam, BoolParam]
+@dataclass(frozen=True)
+class MaskParam:
+    """Hücre hücre düzenlenen küçük ikili maske ve orijini (ör. özel yapı elemanı).
+
+    Değer bir metindir: satırlar ``/`` ile ayrılır, her hücre ``0``/``1``; ``@r,c`` orijinin
+    satır ve sütunudur (0'dan). Örnek: ``"010/011/000@1,1"``. Orijin üye olmayan bir hücrede
+    de olabilir. En az bir hücre 1 olmalı; boyutlar 1 … ``max_size``.
+    """
+
+    key: str
+    label: str
+    default: str
+    max_size: int = 7
+    help: str = ""
+
+    def __post_init__(self) -> None:
+        if self.decode(self.default, self.max_size) is None:
+            raise ValueError(f"{self.key}: geçersiz varsayılan maske")
+
+    @staticmethod
+    def decode(value: Any, max_size: int = 7) -> tuple[tuple[tuple[int, ...], ...], tuple[int, int]] | None:
+        """``(satırlar, (r, c))`` ya da geçersizse None."""
+        if not isinstance(value, str) or value.count("@") != 1:
+            return None
+        cells, origin = value.split("@")
+        rows = cells.split("/")
+        if not rows or len(rows) > max_size or any(len(r) != len(rows[0]) for r in rows):
+            return None
+        if not 1 <= len(rows[0]) <= max_size or any(ch not in "01" for r in rows for ch in r):
+            return None
+        grid = tuple(tuple(int(ch) for ch in r) for r in rows)
+        if not any(any(r) for r in grid):
+            return None
+        try:
+            r, c = (int(x) for x in origin.split(","))
+        except ValueError:
+            return None
+        if not (0 <= r < len(grid) and 0 <= c < len(grid[0])):
+            return None
+        return grid, (r, c)
+
+    @staticmethod
+    def encode(grid, origin: tuple[int, int]) -> str:
+        return "/".join("".join("1" if v else "0" for v in row) for row in grid) + f"@{origin[0]},{origin[1]}"
+
+    def validate(self, value: Any) -> str:
+        parsed = self.decode(value, self.max_size)
+        return self.default if parsed is None else self.encode(*parsed)
+
+
+ParamSpec = Union[IntParam, FloatParam, ChoiceParam, BoolParam, MaskParam]
 
 
 # --------------------------------------------------------------------------
