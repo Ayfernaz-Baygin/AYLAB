@@ -10,7 +10,7 @@ Dalga boyları: yedi kategori görünür spektrumu kırmızıdan (680 nm) mora
 
 from __future__ import annotations
 
-from processing import intensity
+from processing import filters, intensity
 from processing.registry import (
     Algorithm,
     AlgorithmRegistry,
@@ -89,14 +89,47 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                FloatParam("clip", "CLAHE · clip limit", 2.0, 0.5, 10.0, step=0.5, decimals=1),
                IntParam("tiles", "CLAHE · tile grid", 8, 2, 16, help="Tiles per side (N × N)."))),
     # 03 — Spatial Filtering
-    Algorithm("mean_blur", "Mean Filter", "spatial", "Box filter: averages each neighbourhood.", (_KERNEL,)),
-    Algorithm("gaussian_blur", "Gaussian Filter", "spatial", "Weighted smoothing with a Gaussian kernel.",
-              (IntParam("ksize", "Kernel size", 5, 1, 31, odd_only=True, suffix="px"),
-               FloatParam("sigma", "Sigma σ", 1.0, 0.1, 10.0, step=0.1))),
-    Algorithm("median_blur", "Median Filter", "spatial", "Non-linear filter; removes salt-and-pepper noise.",
-              (_KERNEL,)),
-    Algorithm("laplacian", "Laplacian Sharpen", "spatial", "Second-derivative based sharpening.",
-              (IntParam("ksize", "Aperture", 3, 1, 7, odd_only=True), FloatParam("weight", "Strength", 1.0, 0.0, 3.0))),
+    Algorithm("mean_blur", "Mean Filter", "spatial",
+              "Normalized box kernel: each pixel becomes the average of its k×k neighbourhood "
+              "(weights 1/k²). Larger kernels smooth more strongly but also blur edges.",
+              (IntParam("ksize", "Kernel size k", 3, 1, 31, odd_only=True, suffix="px",
+                        help="Odd k×k window. k = 1 leaves the image unchanged."),)),
+    Algorithm("gaussian_blur", "Gaussian Filter", "spatial",
+              "Gaussian convolution, w ∝ exp(−(s² + t²) / 2σ²), normalized to sum 1. Smooths with "
+              "less ringing than the box filter; choose k ≈ 6σ + 1 to cover ±3σ.",
+              (IntParam("ksize", "Kernel size k", 5, 1, 31, odd_only=True, suffix="px",
+                        help="Odd k×k window; a kernel smaller than 6σ + 1 is truncated."),
+               FloatParam("sigma_x", "Sigma X σ", 1.0, 0.1, 10.0, step=0.1, suffix="px",
+                          help="Standard deviation in pixels (σY = σX, isotropic). Must be > 0."))),
+    Algorithm("median_blur", "Median Filter", "spatial",
+              "Non-linear order-statistic filter: each pixel becomes the median of its k×k "
+              "neighbourhood. Removes salt-and-pepper noise while keeping edges sharper than averaging.",
+              (IntParam("ksize", "Kernel size k", 3, 3, 31, odd_only=True, suffix="px",
+                        help="Odd k ≥ 3 (OpenCV medianBlur requirement)."),)),
+    Algorithm("sobel_x", "Sobel X", "spatial",
+              "Horizontal derivative Gx ≈ ∂f/∂x — highlights VERTICAL edges. Computed in float on "
+              "luminance Y = 0.299R + 0.587G + 0.114B; signs are kept until display.",
+              (IntParam("ksize", "Aperture", 3, 1, 7, odd_only=True,
+                        help="Sobel kernel size: 1, 3, 5 or 7."),
+               ChoiceParam("display", "Display", (("abs", "Magnitude"), ("signed", "Signed")), "abs",
+                           help="MAGNITUDE: |Gx| scaled so the strongest edge is 255.  "
+                                "SIGNED: 0 → mid-gray, positive brighter, negative darker."))),
+    Algorithm("sobel_y", "Sobel Y", "spatial",
+              "Vertical derivative Gy ≈ ∂f/∂y — highlights HORIZONTAL edges. Computed in float on "
+              "luminance Y = 0.299R + 0.587G + 0.114B; signs are kept until display.",
+              (IntParam("ksize", "Aperture", 3, 1, 7, odd_only=True,
+                        help="Sobel kernel size: 1, 3, 5 or 7."),
+               ChoiceParam("display", "Display", (("abs", "Magnitude"), ("signed", "Signed")), "abs",
+                           help="MAGNITUDE: |Gy| scaled so the strongest edge is 255.  "
+                                "SIGNED: 0 → mid-gray, positive brighter, negative darker."))),
+    Algorithm("laplacian", "Laplacian Filter", "spatial",
+              "Second derivative ∇²f = ∂²f/∂x² + ∂²f/∂y² on luminance. Isotropic: responds to "
+              "intensity changes in every direction; edges lie at its zero-crossings.",
+              (ChoiceParam("neighbours", "Kernel", (("4", "4-neighbour"), ("8", "8-neighbour")), "4",
+                           help="4: [0 1 0; 1 −4 1; 0 1 0]   8: [1 1 1; 1 −8 1; 1 1 1]"),
+               ChoiceParam("display", "Display", (("abs", "Magnitude"), ("signed", "Signed")), "abs",
+                           help="MAGNITUDE: |∇²f| scaled so the strongest response is 255.  "
+                                "SIGNED: 0 → mid-gray, so zero-crossings are visible."))),
     Algorithm("unsharp", "Unsharp Masking", "spatial", "Adds back the difference from a blurred copy.",
               (FloatParam("amount", "Amount", 1.0, 0.0, 5.0), FloatParam("sigma", "Sigma σ", 1.5, 0.1, 10.0))),
     # 04 — Morphological Processing
@@ -158,6 +191,12 @@ IMPLEMENTATIONS = {
     "gamma": intensity.gamma_correction,
     "contrast_stretch": intensity.contrast_stretch,
     "hist_eq": intensity.equalize_histogram,
+    "mean_blur": filters.mean_filter,
+    "gaussian_blur": filters.gaussian_filter,
+    "median_blur": filters.median_filter,
+    "sobel_x": filters.sobel_x,
+    "sobel_y": filters.sobel_y,
+    "laplacian": filters.laplacian,
 }
 
 
