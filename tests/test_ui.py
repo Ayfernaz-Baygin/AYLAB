@@ -74,7 +74,7 @@ def test_selecting_algorithm_builds_dynamic_form(window):
 def test_apply_pending_algorithm_keeps_image_and_reports(window, image_path):
     window.load_image(image_path)
     before = window.current_image.copy()
-    window.navigator.select_algorithm("negative")
+    window.navigator.select_algorithm("log")  # henüz bağlanmamış bir algoritma
     assert window.parameters.apply_button.isEnabled()
     window.parameters.apply_button.click()
     np.testing.assert_array_equal(window.current_image, before)

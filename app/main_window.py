@@ -6,6 +6,7 @@ Durum (orijinal/işlenmiş görüntü, geçmiş) burada; görüntü işleme mant
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ from app.status_panel import Telemetry
 from processing.analysis import describe
 from processing.catalog import REGISTRY
 from processing.image_io import SUPPORTED_EXTENSIONS, ImageIOError, read_image, save_image
-from processing.registry import AlgorithmNotImplemented, AlgorithmRegistry
+from processing.registry import AlgorithmNotImplemented, AlgorithmParameterError, AlgorithmRegistry
 
 _IMAGE_FILTER = (
     "Images (" + " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS) + ");;All files (*)"
@@ -242,20 +243,31 @@ class MainWindow(QMainWindow):
         if self.current_image is None:
             return False
         algorithm = self.registry.get(key)
+        resolved = algorithm.resolve_params(params)
         self.telemetry.set_state("PROCESSING")
+        started = time.perf_counter()
         try:
-            result = algorithm.run(self.current_image, params)
+            result = algorithm.run(self.current_image, resolved)
         except AlgorithmNotImplemented:
             self.telemetry.set_state("PENDING")
             self.statusBar().showMessage(f"{algorithm.title}: algorithm module not connected yet.", 6000)
+            return False
+        except AlgorithmParameterError as exc:
+            self.telemetry.set_state("ERROR")
+            self.statusBar().showMessage(f"{algorithm.title}: invalid parameters — {exc}", 8000)
+            QMessageBox.warning(self, "Invalid parameters", f"{algorithm.title}\n\n{exc}")
             return False
         except Exception as exc:  # Algoritma hatası arayüzü çökertmesin
             self.telemetry.set_state("ERROR")
             QMessageBox.warning(self, f"{algorithm.title} failed", str(exc))
             return False
+        elapsed_ms = (time.perf_counter() - started) * 1000
         self.set_processed_image(result)
         self.telemetry.set_state("DONE")
-        self.statusBar().showMessage(f"Applied {algorithm.title}.", 5000)
+        summary = ", ".join(f"{k}={v}" for k, v in resolved.items())
+        self.statusBar().showMessage(
+            f"Applied {algorithm.title}" + (f" ({summary})" if summary else "") + f" in {elapsed_ms:.1f} ms"
+        )
         return True
 
     # ------------------------------------------------------------------

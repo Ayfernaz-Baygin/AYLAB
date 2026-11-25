@@ -10,6 +10,7 @@ Dalga boyları: yedi kategori görünür spektrumu kırmızıdan (680 nm) mora
 
 from __future__ import annotations
 
+from processing import intensity
 from processing.registry import (
     Algorithm,
     AlgorithmRegistry,
@@ -59,19 +60,34 @@ ALGORITHMS: tuple[Algorithm, ...] = (
               (IntParam("dx", "Offset X", 0, -500, 500, suffix="px"),
                IntParam("dy", "Offset Y", 0, -500, 500, suffix="px"))),
     # 02 — Intensity Transformations
-    Algorithm("negative", "Negative", "intensity", "Inverts intensities: s = L − 1 − r."),
+    Algorithm("negative", "Negative", "intensity",
+              "Inverts intensities: s = (L − 1) − r. Alpha is preserved."),
     Algorithm("log", "Log Transform", "intensity", "Expands dark values: s = c · log(1 + r).",
               (FloatParam("c", "Constant c", 1.0, 0.1, 5.0, step=0.1),)),
-    Algorithm("gamma", "Gamma Correction", "intensity", "Power-law transform: s = c · r^γ.",
-              (FloatParam("gamma", "Gamma γ", 1.0, 0.1, 5.0, step=0.05),
-               FloatParam("c", "Constant c", 1.0, 0.1, 3.0, step=0.1))),
+    Algorithm("gamma", "Gamma Correction", "intensity",
+              "Power law on normalised intensities: s = 255 · c · (r/255)^γ. "
+              "γ < 1 brightens shadows, γ > 1 darkens highlights.",
+              (FloatParam("gamma", "Gamma γ", 1.0, 0.05, 10.0, step=0.05,
+                          help="γ < 1 brightens, γ > 1 darkens; γ = 1 is the identity."),
+               FloatParam("c", "Constant c", 1.0, 0.1, 3.0, step=0.05,
+                          help="Gain; results above 255 are clipped."))),
     Algorithm("contrast_stretch", "Contrast Stretching", "intensity",
-              "Maps an input range linearly to the full output range.",
-              (IntParam("low", "Input low", 0, 0, 255), IntParam("high", "Input high", 255, 0, 255))),
+              "Linear min–max stretch: s = 255 · (r − r_min) / (r_max − r_min). "
+              "AUTO reads r_min/r_max from the image; MANUAL uses the inputs below.",
+              (ChoiceParam("mode", "Range", (("auto", "Auto"), ("manual", "Manual")), "auto"),
+               FloatParam("saturate", "Auto · saturate tails", 0.0, 0.0, 5.0, step=0.1, decimals=1, suffix="%",
+                          help="AUTO only: ignore this percentage of the darkest and brightest pixels."),
+               IntParam("low", "Manual · input low", 0, 0, 255, help="MANUAL only: maps to 0."),
+               IntParam("high", "Manual · input high", 255, 0, 255, help="MANUAL only: maps to 255."))),
     Algorithm("hist_eq", "Histogram Equalization", "intensity",
-              "Redistributes intensities for a flatter histogram.",
+              "CDF-based remapping for a flatter histogram. Color images are equalized on the "
+              "luminance channel only, so hues are kept.",
               (ChoiceParam("method", "Method", (("global", "Global"), ("clahe", "CLAHE")), "global"),
-               FloatParam("clip", "CLAHE clip limit", 2.0, 0.5, 10.0, step=0.5))),
+               ChoiceParam("space", "Color · luminance channel",
+                           (("ycrcb", "YCrCb · Y"), ("lab", "Lab · L*"), ("hsv", "HSV · V")), "ycrcb",
+                           help="Ignored for grayscale images."),
+               FloatParam("clip", "CLAHE · clip limit", 2.0, 0.5, 10.0, step=0.5, decimals=1),
+               IntParam("tiles", "CLAHE · tile grid", 8, 2, 16, help="Tiles per side (N × N)."))),
     # 03 — Spatial Filtering
     Algorithm("mean_blur", "Mean Filter", "spatial", "Box filter: averages each neighbourhood.", (_KERNEL,)),
     Algorithm("gaussian_blur", "Gaussian Filter", "spatial", "Weighted smoothing with a Gaussian kernel.",
@@ -135,12 +151,24 @@ ALGORITHMS: tuple[Algorithm, ...] = (
 )
 
 
+# Uygulanmış algoritmalar: anahtar → processing modülündeki fonksiyon.
+# Yeni bir algoritma yazıldığında yalnızca buraya bir satır eklenir.
+IMPLEMENTATIONS = {
+    "negative": intensity.negative,
+    "gamma": intensity.gamma_correction,
+    "contrast_stretch": intensity.contrast_stretch,
+    "hist_eq": intensity.equalize_histogram,
+}
+
+
 def build_registry() -> AlgorithmRegistry:
     registry = AlgorithmRegistry()
     for category in CATEGORIES:
         registry.add_category(category)
     for algorithm in ALGORITHMS:
         registry.add(algorithm)
+    for key, func in IMPLEMENTATIONS.items():
+        registry.bind(key, func)
     return registry
 
 

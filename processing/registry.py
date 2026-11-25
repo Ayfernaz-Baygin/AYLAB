@@ -112,7 +112,7 @@ class BoolParam:
     help: str = ""
 
     def validate(self, value: Any) -> bool:
-        return bool(value)
+        return self.default if value is None else bool(value)
 
 
 ParamSpec = Union[IntParam, FloatParam, ChoiceParam, BoolParam]
@@ -125,6 +125,15 @@ ParamSpec = Union[IntParam, FloatParam, ChoiceParam, BoolParam]
 
 class AlgorithmNotImplemented(NotImplementedError):
     """Tanımı olan ama işlevi henüz bağlanmamış algoritma çalıştırıldığında."""
+
+
+class AlgorithmParameterError(ValueError):
+    """Parametreler (veya parametre–görüntü birleşimi) geçersiz olduğunda.
+
+    Tek tek sınır kontrolleri ``ParamSpec.validate`` ile yapılır; bu hata,
+    örneğin "alt sınır ≥ üst sınır" gibi parametreler arası tutarsızlıklar ve
+    desteklenmeyen görüntü biçimleri için kullanıcıya gösterilecek mesajı taşır.
+    """
 
 
 @dataclass(frozen=True)
