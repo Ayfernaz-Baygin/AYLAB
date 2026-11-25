@@ -172,6 +172,7 @@ class MainWindow(QMainWindow):
         self.original_image = image
         self.current_image = image.copy()
         self.history.clear()
+        self.parameters.set_report(None)
         self.stage.set_original(self.original_image)
         self.stage.set_processed(self.current_image)
         self._set_image_loaded(True)
@@ -223,6 +224,7 @@ class MainWindow(QMainWindow):
             self.history.push(self.current_image)
         self.current_image = self.original_image.copy()
         self.stage.set_processed(self.current_image)
+        self.parameters.set_report(None)   # rapor yalnızca onu üreten çıktıya aittir
         self._refresh_image_info()
         self._refresh_history()
         self.telemetry.set_state("READY")
@@ -234,6 +236,7 @@ class MainWindow(QMainWindow):
             return
         self.current_image = previous
         self.stage.set_processed(previous)
+        self.parameters.set_report(None)
         self._refresh_image_info()
         self._refresh_history()
         self.statusBar().showMessage("Undid last operation.")
@@ -247,7 +250,7 @@ class MainWindow(QMainWindow):
         self.telemetry.set_state("PROCESSING")
         started = time.perf_counter()
         try:
-            result = algorithm.run(self.current_image, resolved)
+            outcome = algorithm.execute(self.current_image, resolved)
         except AlgorithmNotImplemented:
             self.telemetry.set_state("PENDING")
             self.statusBar().showMessage(f"{algorithm.title}: algorithm module not connected yet.", 6000)
@@ -262,11 +265,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, f"{algorithm.title} failed", str(exc))
             return False
         elapsed_ms = (time.perf_counter() - started) * 1000
-        self.set_processed_image(result)
+        self.set_processed_image(outcome.image)
+        self.parameters.set_report(outcome.report)   # rapor yoksa önceki rapor kalkar
         self.telemetry.set_state("DONE")
         summary = ", ".join(f"{k}={v}" for k, v in resolved.items())
+        report_text = f" — {outcome.report.summary()}" if hasattr(outcome.report, "summary") else ""
         self.statusBar().showMessage(
-            f"Applied {algorithm.title}" + (f" ({summary})" if summary else "") + f" in {elapsed_ms:.1f} ms"
+            f"Applied {algorithm.title}" + report_text + (f" ({summary})" if summary else "")
+            + f" in {elapsed_ms:.1f} ms"
         )
         return True
 

@@ -52,7 +52,7 @@ from processing.common import (
     split_alpha,
 )
 from processing.filters import validate_ksize
-from processing.registry import AlgorithmParameterError
+from processing.registry import AlgorithmParameterError, ProcessResult
 
 SE_SHAPES = ("rect", "ellipse", "cross")
 BINARIZE_MODES = ("otsu", "manual")
@@ -233,6 +233,303 @@ def binary_closing(mask: np.ndarray, se: StructuringElement) -> np.ndarray:
 def binary_gradient(mask: np.ndarray, se: StructuringElement) -> np.ndarray:
     """(A ⊕ B) − (A ⊖ B): nesne sınırının iç ve dış kuşağı."""
     return binary_dilation(mask, se) & ~binary_erosion(mask, se)
+
+
+def boundary_mask(mask: np.ndarray, se: StructuringElement) -> np.ndarray:
+    """β(A) = A − (A ⊖ B) (slayt 53–55): erosion'ın sildiği ön plan pikselleri.
+
+    Küme farkı A ∩ (A ⊖ B)ᶜ olarak alınır; sonuç her zaman A'nın alt kümesidir
+    (iç sınır). Gradyandan farkı: dış kuşak (A ⊕ B) − A dahil değildir.
+    Görüntü dışı arka plan olduğundan, kenara değen nesnelerin görüntü
+    kenarındaki pikselleri de sınırdır.
+    """
+    a = _validate_mask(mask)
+    return a & ~binary_erosion(a, se)
+
+
+# --------------------------------------------------------------------------
+# Delik doldurma (hole filling) — slayt 56–59
+# --------------------------------------------------------------------------
+#
+# Delik: ön planla çevrili, görüntü dışına (arka plana) bağlanmayan arka plan
+# bölgesi. Bağlantı, yeniden yapılandırmada kullanılan SE'ye karşılık gelir:
+# 3×3 artı → 4-bağlantılı arka plan (ders kitabı), 3×3 kare → 8-bağlantılı.
+
+HOLE_METHODS = ("flood", "reconstruction")
+HOLE_SEED_POLICIES = ("largest", "centre", "all")
+HOLE_SE_SHAPES = {"cross": 4, "rect": 8}   # 3×3 SE → arka plan bağlantılılığı
+
+
+def hole_labels(mask: np.ndarray, connectivity: int = 4) -> tuple[np.ndarray, list[int]]:
+    """Arka plan bileşen etiketleri ve bunlardan *delik* olanlar (görüntü kenarına değmeyenler)."""
+    a = _validate_mask(mask)
+    if isinstance(connectivity, bool) or connectivity not in (4, 8):
+        raise AlgorithmParameterError(f"Connectivity must be 4 or 8 (got {connectivity!r}).")
+    n, labels = cv2.connectedComponents((~a).astype(np.uint8), connectivity=connectivity)
+    border = set(np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])).tolist())
+    holes = [i for i in range(1, n) if i not in border]
+    return labels, holes
+
+
+def _validate_seeds(a: np.ndarray, seeds, connectivity: int) -> list[tuple[int, int]]:
+    h, w = a.shape
+    labels, holes = hole_labels(a, connectivity)
+    hole_set = set(holes)
+    out = []
+    for seed in seeds:
+        if not isinstance(seed, (tuple, list)) or len(seed) != 2:
+            raise AlgorithmParameterError(f"A seed must be an (x, y) pair (got {seed!r}).")
+        x, y = _validate_int(seed[0], "Seed x"), _validate_int(seed[1], "Seed y")
+        if not (0 <= x < w and 0 <= y < h):
+            raise AlgorithmParameterError(f"Seed ({x}, {y}) is outside the {w}×{h} image.")
+        if a[y, x]:
+            raise AlgorithmParameterError(f"Seed ({x}, {y}) lies on the foreground; a seed must be inside a hole.")
+        if labels[y, x] not in hole_set:
+            raise AlgorithmParameterError(
+                f"Seed ({x}, {y}) is not inside a closed hole: its background region reaches the image "
+                f"border, so X_k would flood the whole background.")
+        out.append((x, y))
+    return out
+
+
+def fill_holes_reconstruction(mask: np.ndarray, seeds, connectivity: int = 4) -> tuple[np.ndarray, int]:
+    """X_k = (X_{k−1} ⊕ B) ∩ Aᶜ, X₀ = tohumlar; X_k = X_{k−1} olunca durur. Döndürür: (X_k ∪ A, k).
+
+    B = 3×3 artı (connectivity=4, ders kitabı) veya 3×3 kare (connectivity=8).
+    Yalnızca tohum içeren delikler dolar. Tohumlar (x, y) = (sütun, satır).
+    Ön plan üzerindeki, görüntü dışındaki veya kenara açılan bir arka plan
+    bölgesindeki tohum ``AlgorithmParameterError`` verir.
+    """
+    a = _validate_mask(mask)
+    seeds = _validate_seeds(a, list(seeds), connectivity)
+    se = structuring_element("cross" if connectivity == 4 else "rect", 3, 3)
+    ac = ~a
+    x = np.zeros_like(a)
+    for cx, cy in seeds:
+        x[cy, cx] = True
+    k = 0
+    while True:
+        nxt = binary_dilation(x, se) & ac
+        k += 1
+        if np.array_equal(nxt, x):
+            break
+        x = nxt
+    return x | a, k
+
+
+def fill_holes_flood(mask: np.ndarray) -> np.ndarray:
+    """OpenCV yaklaşımı (slayt 59): arka planı sınırdan 4-bağlantılı taşır, tersler, A ile OR'lar.
+
+    Görüntü bir piksellik arka plan çerçevesiyle genişletilir ve taşma bu
+    çerçevenin köşesinden başlatılır. Böylece kenara değen TÜM arka plan
+    bölgeleri "dışarı" sayılır ve (0, 0) ön plan olsa bile doğru çalışır.
+    (Slayttaki kod doğrudan (0, 0)'dan başlar; (0, 0) ön plansa ya da kenardaki
+    arka plan ayrık parçalara bölünmüşse yanlış sonuç verir.)
+    """
+    a = _validate_mask(mask)
+    padded = np.pad(np.where(a, 255, 0).astype(np.uint8), 1)
+    flood = padded.copy()
+    ff_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 255, flags=4)
+    holes = cv2.bitwise_not(flood)[1:-1, 1:-1] > 0
+    return a | holes
+
+
+def auto_seeds(mask: np.ndarray, policy: str = "largest", connectivity: int = 4) -> list[tuple[int, int]]:
+    """GUI için tohum seçimi: her delikten, ağırlık merkezine en yakın delik pikseli.
+
+    largest — en büyük delik;  centre — tohumu görüntü merkezine en yakın delik;
+    all — her delik için bir tohum (sonuç flood fill ile aynıdır, connectivity=4).
+    """
+    if policy not in HOLE_SEED_POLICIES:
+        raise AlgorithmParameterError(f"Seed policy must be one of {', '.join(HOLE_SEED_POLICIES)} (got {policy!r}).")
+    labels, holes = hole_labels(mask, connectivity)
+    if not holes:
+        return []
+    seeds, sizes = [], []
+    for i in holes:
+        ys, xs = np.nonzero(labels == i)
+        j = int(np.argmin((ys - ys.mean()) ** 2 + (xs - xs.mean()) ** 2))
+        seeds.append((int(xs[j]), int(ys[j])))
+        sizes.append(len(ys))
+    if policy == "all":
+        return seeds
+    if policy == "largest":
+        return [seeds[int(np.argmax(sizes))]]
+    h, w = labels.shape
+    cy, cx = (h - 1) / 2, (w - 1) / 2
+    return [min(seeds, key=lambda s: (s[1] - cy) ** 2 + (s[0] - cx) ** 2)]
+
+
+# --------------------------------------------------------------------------
+# Bağlantılı bileşenler (connected components) — slayt 60–62
+# --------------------------------------------------------------------------
+#
+# Ön plan pikselleri, B'nin tanımladığı komşulukla birbirine ulaşabiliyorsa
+# aynı bileşendir: 3×3 artı → 4-bağlantı, 3×3 kare → 8-bağlantı.
+# Etiketler: arka plan 0, bileşenler 1…N; numaralar, bileşenin raster
+# sırasındaki (yukarıdan aşağı, soldan sağa) İLK pikseline göre verilir —
+# dersin yöntemindeki "henüz etiketlenmemiş ilk ön plan pikseli tohumdur"
+# kuralıyla aynı sıra. Etiket matrisi int32'dir; renkli görüntü ondan türetilir.
+
+CC_CONNECTIVITY = {"4": 4, "8": 8}
+CC_DISPLAYS = ("labels", "boxes")
+
+
+@dataclass(frozen=True)
+class Component:
+    label: int
+    area: int          # piksel sayısı
+    x: int             # sınırlayıcı kutu: sol üst köşe (sütun, satır), genişlik, yükseklik
+    y: int
+    width: int
+    height: int
+    cx: float          # ağırlık merkezi (piksel koordinatlarının ortalaması)
+    cy: float
+
+
+@dataclass(frozen=True)
+class ComponentReport:
+    """Etiket matrisi (int32, arka plan 0) ve bileşen istatistikleri."""
+
+    labels: np.ndarray
+    components: tuple[Component, ...]
+    connectivity: int
+
+    @property
+    def count(self) -> int:
+        """Bileşen sayısı (arka plan hariç)."""
+        return len(self.components)
+
+    def summary(self) -> str:
+        se = "3×3 cross" if self.connectivity == 4 else "3×3 square"
+        return f"{self.count} component{'s' if self.count != 1 else ''} · {self.connectivity}-connected (B = {se})"
+
+
+def _validate_connectivity(connectivity) -> int:
+    if isinstance(connectivity, bool):
+        raise AlgorithmParameterError(f"Connectivity must be 4 or 8 (got {connectivity!r}).")
+    key = str(connectivity)
+    if key not in CC_CONNECTIVITY:
+        raise AlgorithmParameterError(f"Connectivity must be 4 or 8 (got {connectivity!r}).")
+    return CC_CONNECTIVITY[key]
+
+
+def _raster_order_lut(labels: np.ndarray, n: int) -> np.ndarray:
+    """Eski etiket → yeni etiket tablosu: bileşenler raster sıradaki ilk piksellerine göre 1…n−1."""
+    flat = labels.ravel()
+    first = np.full(n, flat.size, np.int64)
+    np.minimum.at(first, flat, np.arange(flat.size))
+    order = np.argsort(first[1:], kind="stable") + 1        # eski etiketler, yeni sırayla
+    lut = np.zeros(n, np.int32)
+    lut[order] = np.arange(1, n, dtype=np.int32)
+    return lut
+
+
+def label_components(mask: np.ndarray, connectivity=8) -> ComponentReport:
+    """OpenCV ``connectedComponentsWithStats`` ile etiketleme ve istatistikler.
+
+    OpenCV'nin iç numaralaması algoritmaya göre değişebildiği için etiketler
+    raster sırasına göre yeniden numaralanır; istatistikler aynı tabloyla taşınır.
+    """
+    a = _validate_mask(mask)
+    conn = _validate_connectivity(connectivity)
+    n, raw, stats, centroids = cv2.connectedComponentsWithStats(a.astype(np.uint8), connectivity=conn,
+                                                                ltype=cv2.CV_32S)
+    lut = _raster_order_lut(raw, n)
+    labels = lut[raw]
+    comps = [None] * (n - 1)
+    for old in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[old])
+        comps[lut[old] - 1] = Component(int(lut[old]), area, x, y, w, h,
+                                        float(centroids[old][0]), float(centroids[old][1]))
+    return ComponentReport(labels, tuple(comps), conn)
+
+
+def label_components_iterative(mask: np.ndarray, connectivity=8) -> np.ndarray:
+    """Dersin yöntemi (laboratuvar ``ccGrow``): X_k = (X_{k−1} ⊕ B) ∩ A, X_k = X_{k−1} olunca dur.
+
+    Tohum, henüz etiketlenmemiş ilk (raster sırası) ön plan pikselidir; her
+    bileşene sıradaki etiket verilir. Genişletme yalnızca X'in sınırlayıcı
+    kutusu + 1 piksellik pencerede yapılır (X her adımda en fazla 1 piksel
+    büyüdüğü için sonuç tam görüntüdekiyle aynıdır). Referans/eğitim amaçlıdır;
+    GUI ``label_components`` (OpenCV) kullanır.
+    """
+    a = _validate_mask(mask)
+    conn = _validate_connectivity(connectivity)
+    se = structuring_element("cross" if conn == 4 else "rect", 3, 3)
+    h, w = a.shape
+    labels = np.zeros((h, w), np.int32)
+    remaining = a.copy()
+    flat = remaining.ravel()          # remaining ile aynı bellek
+    nxt, start = 1, 0
+    while True:
+        hits = np.flatnonzero(flat[start:])
+        if hits.size == 0:
+            break
+        start += int(hits[0])
+        r, c = divmod(start, w)
+        r0, r1, c0, c1 = r, r + 1, c, c + 1
+        x = np.zeros((1, 1), bool)
+        x[0, 0] = True
+        while True:
+            R0, R1, C0, C1 = max(r0 - 1, 0), min(r1 + 1, h), max(c0 - 1, 0), min(c1 + 1, w)
+            win = np.zeros((R1 - R0, C1 - C0), bool)
+            win[r0 - R0:r1 - R0, c0 - C0:c1 - C0] = x
+            grown = binary_dilation(win, se) & a[R0:R1, C0:C1]
+            if np.array_equal(grown, win):
+                break
+            rows, cols = np.nonzero(grown)
+            r0, r1, c0, c1 = R0 + rows.min(), R0 + rows.max() + 1, C0 + cols.min(), C0 + cols.max() + 1
+            x = grown[r0 - R0:r1 - R0, c0 - C0:c1 - C0]
+        sub = labels[r0:r1, c0:c1]
+        sub[x] = nxt
+        remaining[r0:r1, c0:c1] &= ~x
+        nxt += 1
+    return labels
+
+
+def label_colors(n: int) -> np.ndarray:
+    """(n+1)×3 BGR palet: 0 = siyah (arka plan); i ≥ 1 altın açı (137.5°) adımlı tonlar.
+
+    Ardışık etiketler belirgin biçimde farklı tonlar alır; ton döngüsel olduğundan
+    çok sayıda bileşende benzer renkler yeniden görülebilir (etiketler yine farklıdır).
+    """
+    palette = np.zeros((n + 1, 3), np.uint8)
+    if n:
+        i = np.arange(1, n + 1)
+        hsv = np.zeros((n, 1, 3), np.uint8)
+        hsv[:, 0, 0] = np.round((i * 137.50776) % 360 / 2).astype(np.uint8) % 180
+        hsv[:, 0, 1] = np.where(i % 2, 200, 150).astype(np.uint8)
+        hsv[:, 0, 2] = np.where(i % 3 == 0, 205, 255).astype(np.uint8)
+        palette[1:] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[:, 0]
+    return palette
+
+
+def colorize_labels(labels: np.ndarray) -> np.ndarray:
+    """int32 etiket matrisini BGR görüntüye çevirir; indeksleme int ile yapılır (8-bit sarma yok)."""
+    labels = np.asarray(labels)
+    n = int(labels.max()) if labels.size else 0
+    return label_colors(n)[labels]
+
+
+BOX_MIN_SIZE = 3   # bu boyuttan küçük bileşenlere kutu/merkez çizilmez (rengi örtülmesin)
+
+
+def draw_component_boxes(color: np.ndarray, report: ComponentReport) -> np.ndarray:
+    """Sınırlayıcı kutuları ve ağırlık merkezlerini (küçük artı) beyaz çizer.
+
+    Kutu bileşenin 1 piksel DIŞINA çizilir (bileşenin kendi piksellerini örtmez).
+    En az ``BOX_MIN_SIZE`` × ``BOX_MIN_SIZE`` olmayan bileşenlere (tek pikseller,
+    ince kırıntılar) çizim yapılmaz; tabloda yine listelenirler.
+    """
+    out = color.copy()
+    for comp in report.components:
+        if comp.width < BOX_MIN_SIZE or comp.height < BOX_MIN_SIZE:
+            continue
+        cv2.rectangle(out, (comp.x - 1, comp.y - 1), (comp.x + comp.width, comp.y + comp.height), (255, 255, 255), 1)
+        cv2.drawMarker(out, (int(round(comp.cx)), int(round(comp.cy))), (255, 255, 255), cv2.MARKER_CROSS, 5, 1)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -441,6 +738,55 @@ def gradient(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreg
              anchor_y: int = -1) -> np.ndarray:
     a, se = _prepare(image, binarize, thresh, foreground, shape, width, height, anchor_x, anchor_y)
     return _to_output(binary_gradient(a, se), image)
+
+
+def boundary_extraction(image: np.ndarray, binarize: str = "otsu", thresh: int = 127,
+                        foreground: str = "bright", shape: str = "rect", width: int = 3, height: int = 3,
+                        anchor_x: int = -1, anchor_y: int = -1) -> np.ndarray:
+    """Sınır çıkarma β(A) = A − (A ⊖ B); sınır pikselleri 255, diğerleri 0."""
+    a, se = _prepare(image, binarize, thresh, foreground, shape, width, height, anchor_x, anchor_y)
+    return _to_output(boundary_mask(a, se), image)
+
+
+def hole_filling(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+                 method: str = "flood", seeds: str = "largest", shape: str = "cross") -> np.ndarray:
+    """Delik doldurma; çıktı A ∪ (doldurulan delikler), 0/255.
+
+    flood          — tüm kapalı delikler tek seferde (4-bağlantılı, slayt 59).
+    reconstruction — X_k = (X_{k−1} ⊕ B) ∩ Aᶜ; yalnızca ``seeds`` politikasının
+                     seçtiği delik(ler) dolar. ``shape``: 3×3 cross (4-bağlantılı) / rect (8).
+    """
+    if method not in HOLE_METHODS:
+        raise AlgorithmParameterError(f"Method must be 'flood' or 'reconstruction' (got {method!r}).")
+    if shape not in HOLE_SE_SHAPES:
+        raise AlgorithmParameterError(f"Hole-filling SE must be 'cross' or 'rect' (got {shape!r}).")
+    if seeds not in HOLE_SEED_POLICIES:
+        raise AlgorithmParameterError(f"Seed policy must be one of {', '.join(HOLE_SEED_POLICIES)} (got {seeds!r}).")
+    a = to_binary(image, binarize, thresh, foreground)
+    if method == "flood":
+        return _to_output(fill_holes_flood(a), image)
+    conn = HOLE_SE_SHAPES[shape]
+    filled, _ = fill_holes_reconstruction(a, auto_seeds(a, seeds, conn), conn)
+    return _to_output(filled, image)
+
+
+def connected_components(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",
+                         connectivity: str = "8", display: str = "labels") -> ProcessResult:
+    """Bağlantılı bileşenleri etiketler; renkli etiket görüntüsü + ``ComponentReport`` döndürür.
+
+    Çıktı her zaman renkli (BGR) etiket görüntüsüdür — gri girdide de, çünkü
+    etiketler renkle ayırt edilir; BGRA girdide orijinal alfa eklenir.
+    ``display="boxes"``: kutular ve ağırlık merkezleri de çizilir.
+    """
+    if display not in CC_DISPLAYS:
+        raise AlgorithmParameterError(f"Display must be 'labels' or 'boxes' (got {display!r}).")
+    a = to_binary(image, binarize, thresh, foreground)
+    report = label_components(a, connectivity)
+    color = colorize_labels(report.labels)
+    if display == "boxes":
+        color = draw_component_boxes(color, report)
+    _, alpha = split_alpha(image)
+    return ProcessResult(merge_alpha(color, alpha), report)
 
 
 def hit_or_miss(image: np.ndarray, binarize: str = "otsu", thresh: int = 127, foreground: str = "bright",

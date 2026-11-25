@@ -211,6 +211,44 @@ ALGORITHMS: tuple[Algorithm, ...] = (
               "darkens small dark details, raising local contrast. Computed in int32 and clipped to 0 … 255. "
               "Color: Δ = T_hat(Y) − B_hat(Y) is added to B, G and R equally, so chroma is preserved.",
               _HAT_SE),
+    Algorithm("boundary", "Boundary Extraction", "morphology",
+              "Extracts object boundaries by subtracting the eroded foreground from the original binary "
+              "image: β(A) = A − (A ⊖ B). Only foreground pixels removed by the erosion remain; a larger SE "
+              "gives a thicker boundary.",
+              _MORPH),
+    Algorithm("hole_filling", "Hole Filling", "morphology",
+              "Fills holes — background regions completely enclosed by the foreground. FLOOD FILL (slide 59): "
+              "flood the background from the image border (4-connected), invert, OR with A — every closed "
+              "hole at once. RECONSTRUCTION (slides 56–58): X_k = (X_k−1 ⊕ B) ∩ Aᶜ from a seed until "
+              "X_k = X_k−1, result X_k ∪ A — only seeded holes fill. Gaps open to the border are never filled.",
+              _BINARY_INPUT + (
+                  ChoiceParam("method", "Method", (("flood", "Flood fill"), ("reconstruction", "Reconstruction")),
+                              "flood", help="FLOOD FILL: all closed holes at once.  RECONSTRUCTION: iterative "
+                                            "conditional dilation from seeds; only the seeded hole(s)."),
+                  ChoiceParam("seeds", "Reconstruction · seeds",
+                              (("largest", "Largest"), ("centre", "Centre"), ("all", "All")),
+                              "largest", help="RECONSTRUCTION only. LARGEST: the largest hole.  CENTRE: the hole "
+                                              "nearest the image centre.  ALL: every hole (same result as flood "
+                                              "fill). One seed per hole, at the hole pixel nearest its centroid."),
+                  ChoiceParam("shape", "Reconstruction · SE 3 × 3", (("cross", "Cross"), ("rect", "Square")),
+                              "cross", help="CROSS (textbook): holes are 4-connected background.  SQUARE: "
+                                            "8-connected — a hole that touches the outside only diagonally is "
+                                            "not closed and is not filled."),
+              )),
+    Algorithm("connected_components", "Connected Components", "morphology",
+              "Labels each separate object of the binary image A with its own integer (background = 0) and "
+              "lists its area, bounding box and centroid. Course method: X_k = (X_k−1 ⊕ B) ∩ A grown from an "
+              "unlabelled foreground pixel until X_k = X_k−1. B = 3×3 cross → 4-connected; 3×3 square → "
+              "8-connected (diagonal neighbours join).",
+              _BINARY_INPUT + (
+                  ChoiceParam("connectivity", "Connectivity · SE B", (("4", "4 · Cross"), ("8", "8 · Square")), "8",
+                              help="4: B = 3×3 cross — only edge neighbours connect.  8: B = 3×3 square — "
+                                   "diagonal neighbours connect too."),
+                  ChoiceParam("display", "Display", (("labels", "Labels"), ("boxes", "Labels + boxes")), "labels",
+                              help="Each label gets its own colour (background black); colours may repeat "
+                                   "for many components.  BOXES also draws bounding boxes (1 px outside the "
+                                   "object) and centroids for components of at least 3 × 3 px."),
+              )),
     # 05 — Image Segmentation
     Algorithm("threshold", "Global Threshold", "segmentation", "Binary split at a fixed intensity.",
               (IntParam("thresh", "Threshold", 127, 0, 255), BoolParam("invert", "Invert output"))),
@@ -276,6 +314,9 @@ IMPLEMENTATIONS = {
     "top_hat": morphology.top_hat,
     "black_hat": morphology.black_hat,
     "hat_correction": morphology.hat_correction,
+    "boundary": morphology.boundary_extraction,
+    "hole_filling": morphology.hole_filling,
+    "connected_components": morphology.connected_components,
 }
 
 

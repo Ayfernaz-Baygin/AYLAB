@@ -394,14 +394,15 @@ def test_gray_helpers_reject_non_2d_uint8(bad):
 def test_registry_hat_entries():
     registry = build_registry()
     keys = [a.key for a in registry.in_category("morphology")]
-    assert keys[-3:] == ["top_hat", "black_hat", "hat_correction"]
-    assert [registry.get(k).title for k in keys[-3:]] == ["White Top-Hat", "Black-Hat", "Illumination / Contrast Correction"]
+    hats = keys[keys.index("top_hat"):keys.index("top_hat") + 3]
+    assert hats == ["top_hat", "black_hat", "hat_correction"]
+    assert [registry.get(k).title for k in hats] == ["White Top-Hat", "Black-Hat", "Illumination / Contrast Correction"]
     assert "f − (f ∘ b)" in registry.get("top_hat").summary
     assert "(f • b) − f" in registry.get("black_hat").summary
     assert "img + top_hat − black_hat" in registry.get("hat_correction").summary
     binary_se = [(p.key, p.label, p.minimum, p.maximum) for p in registry.get("opening").params[3:]
                  if hasattr(p, "minimum")]
-    for k in keys[-3:]:
+    for k in hats:
         algo = registry.get(k)
         assert algo.implemented
         assert [p.key for p in algo.params] == ["shape", "width", "height", "anchor_x", "anchor_y"]

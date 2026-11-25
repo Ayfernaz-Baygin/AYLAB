@@ -53,7 +53,7 @@ CASES = [
 def test_hat_operations_listed_in_existing_category(window):
     window.navigator.tiles["morphology"].click()
     rows = list(window.navigator.operation_rows)
-    assert rows[-3:] == HAT_KEYS and len(rows) == 9
+    assert rows[6:9] == HAT_KEYS and len(rows) == 12   # Aşama 3–5: boundary, hole_filling, connected_components
     assert [window.navigator.operation_rows[k].algorithm.title for k in HAT_KEYS] == [
         "White Top-Hat", "Black-Hat", "Illumination / Contrast Correction"]
     assert len(window.navigator.tiles) == 7                     # yeni kategori yok

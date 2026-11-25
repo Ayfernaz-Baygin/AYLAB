@@ -145,7 +145,21 @@ class Category:
     wavelength: int  # nm — arayüzdeki vurgu rengi bu dalga boyundan gelir
 
 
-AlgorithmFunc = Callable[..., np.ndarray]
+@dataclass(frozen=True)
+class ProcessResult:
+    """Görüntüye ek olarak sayısal bir rapor da üreten algoritmaların dönüş tipi.
+
+    ``report`` GUI'den bağımsız bir nesnedir (örn. bağlantılı bileşen tablosu).
+    ``Algorithm.run`` yalnızca ``image``'ı döndürür; raporu isteyen çağıran
+    ``Algorithm.execute`` kullanır. Böylece görüntü döndüren mevcut tüm
+    algoritmalar ve çağrılar değişmeden çalışır.
+    """
+
+    image: np.ndarray
+    report: Any = None
+
+
+AlgorithmFunc = Callable[..., Union[np.ndarray, ProcessResult]]
 
 
 @dataclass(frozen=True)
@@ -169,10 +183,15 @@ class Algorithm:
         values = values or {}
         return {p.key: p.validate(values.get(p.key, p.default)) for p in self.params}
 
-    def run(self, image: np.ndarray, params: dict[str, Any] | None = None) -> np.ndarray:
+    def execute(self, image: np.ndarray, params: dict[str, Any] | None = None) -> ProcessResult:
+        """Algoritmayı çalıştırır; görüntüyü ve (varsa) raporu birlikte döndürür."""
         if self.func is None:
             raise AlgorithmNotImplemented(f"'{self.title}' henüz uygulanmadı.")
-        return self.func(image, **self.resolve_params(params))
+        result = self.func(image, **self.resolve_params(params))
+        return result if isinstance(result, ProcessResult) else ProcessResult(result)
+
+    def run(self, image: np.ndarray, params: dict[str, Any] | None = None) -> np.ndarray:
+        return self.execute(image, params).image
 
 
 class AlgorithmRegistry:

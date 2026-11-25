@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from app import theme
 from app.analysis_panel import AnalysisPanel
+from app.component_report import ComponentReportView
 from app.controls import ParameterControl, ToggleControl, create_control
 from processing.registry import Algorithm, Category
 
@@ -149,6 +150,10 @@ class ParameterPanel(QScrollArea):
         root.addWidget(_Divider())
         root.addSpacing(2)
 
+        # --- rapor (yalnızca rapor üreten işlemlerde görünür) --------------
+        self.report_view = ComponentReportView()
+        root.addWidget(self.report_view)
+
         # --- analiz -----------------------------------------------------
         self.analysis = AnalysisPanel()
         root.addWidget(self.analysis)
@@ -224,6 +229,10 @@ class ParameterPanel(QScrollArea):
 
     def update_analysis(self, current: np.ndarray | None, reference: np.ndarray | None) -> None:
         self.analysis.update_images(current, reference)
+
+    def set_report(self, report) -> None:
+        """Son işlemin sayısal raporu (şimdilik ``ComponentReport``) ya da None."""
+        self.report_view.set_report(report)
 
     # ------------------------------------------------------------------
     def _clear_form(self) -> None:
