@@ -12,6 +12,7 @@ from processing.analysis import histograms
 from processing.image_io import save_image
 
 KEYS = ["erode", "dilate", "opening", "closing", "gradient", "hit_or_miss"]
+HAT_KEYS = ["top_hat", "black_hat", "hat_correction"]  # Aşama 2 (gri ton)
 
 
 @pytest.fixture
@@ -58,7 +59,7 @@ CASES = [
 
 def test_morphology_category_lists_six_operations(window):
     window.navigator.tiles["morphology"].click()
-    assert list(window.navigator.operation_rows) == KEYS
+    assert list(window.navigator.operation_rows) == KEYS + HAT_KEYS
     titles = [window.navigator.operation_rows[k].algorithm.title for k in KEYS]
     assert titles == ["Erosion", "Dilation", "Opening", "Closing", "Morphological Gradient", "Hit-or-Miss Transform"]
     category = window.registry.category("morphology")

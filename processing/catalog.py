@@ -37,18 +37,27 @@ _BINARY_INPUT = (
                 help="BRIGHT: object = Y > T.  DARK: object = Y ≤ T (dark objects on a light "
                      "background, e.g. cells or text)."),
 )
-_STRUCTURING_ELEMENT = (
-    ChoiceParam("shape", "SE shape", (("rect", "Rectangle"), ("ellipse", "Ellipse"), ("cross", "Cross")), "rect",
-                help="RECTANGLE: all ones (width = height → square).  ELLIPSE: inscribed disk.  "
-                     "CROSS: centre row + centre column."),
-    IntParam("width", "SE width", 3, 1, 31, odd_only=True, suffix="px"),
-    IntParam("height", "SE height", 3, 1, 31, odd_only=True, suffix="px",
-             help="1 × k or k × 1 gives a line SE (directional morphology)."),
-    IntParam("anchor_x", "Anchor X · origin column", -1, -1, 30,
-             help="−1 = centre. Otherwise 0 … width − 1 (left = 0)."),
-    IntParam("anchor_y", "Anchor Y · origin row", -1, -1, 30,
-             help="−1 = centre. Otherwise 0 … height − 1 (top = 0)."),
-)
+
+
+def _se_params(size: int = 3) -> tuple:
+    """Yapı elemanı parametreleri; tüm morfoloji işlemleri aynı etiket ve sınırları paylaşır."""
+    return (
+        ChoiceParam("shape", "SE shape", (("rect", "Rectangle"), ("ellipse", "Ellipse"), ("cross", "Cross")), "rect",
+                    help="RECTANGLE: all ones (width = height → square).  ELLIPSE: inscribed disk.  "
+                         "CROSS: centre row + centre column."),
+        IntParam("width", "SE width", size, 1, 31, odd_only=True, suffix="px"),
+        IntParam("height", "SE height", size, 1, 31, odd_only=True, suffix="px",
+                 help="1 × k or k × 1 gives a line SE (directional morphology)."),
+        IntParam("anchor_x", "Anchor X · origin column", -1, -1, 30,
+                 help="−1 = centre. Otherwise 0 … width − 1 (left = 0)."),
+        IntParam("anchor_y", "Anchor Y · origin row", -1, -1, 30,
+                 help="−1 = centre. Otherwise 0 … height − 1 (top = 0)."),
+    )
+
+
+_STRUCTURING_ELEMENT = _se_params(3)
+# Top-hat / black-hat: SE, çıkarılacak ayrıntılardan BÜYÜK olmalı (slayt 44: 40 × 40)
+_HAT_SE = _se_params(15)
 _MORPH = _BINARY_INPUT + _STRUCTURING_ELEMENT
 _ITERATIONS = IntParam("iterations", "Iterations", 1, 1, 10, help="Applies the operation n times with the same SE.")
 
@@ -186,6 +195,22 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                   ChoiceParam("display", "Display", (("matches", "Matches"), ("overlay", "On shape")), "matches",
                               help="MATCHES: matched positions only (255).  ON SHAPE: matches 255 drawn "
                                    "over the binary shape in dark gray (70)."))),
+    Algorithm("top_hat", "White Top-Hat", "morphology",
+              "T_hat(f) = f − (f ∘ b): grayscale image minus its opening. Extracts small BRIGHT details "
+              "that the opening removes (structures smaller than the SE); the slowly varying background "
+              "drops to ≈ 0. Grayscale intensities are used directly — no thresholding. Values are shown "
+              "unscaled; color images use luminance Y.",
+              _HAT_SE),
+    Algorithm("black_hat", "Black-Hat", "morphology",
+              "B_hat(f) = (f • b) − f: closing of the grayscale image minus the image (bottom-hat). Extracts "
+              "small DARK details that the closing fills in. No thresholding; values are shown unscaled; "
+              "color images use luminance Y.",
+              _HAT_SE),
+    Algorithm("hat_correction", "Illumination / Contrast Correction", "morphology",
+              "corrected = img + top_hat − black_hat (same SE for both). Brightens small bright details and "
+              "darkens small dark details, raising local contrast. Computed in int32 and clipped to 0 … 255. "
+              "Color: Δ = T_hat(Y) − B_hat(Y) is added to B, G and R equally, so chroma is preserved.",
+              _HAT_SE),
     # 05 — Image Segmentation
     Algorithm("threshold", "Global Threshold", "segmentation", "Binary split at a fixed intensity.",
               (IntParam("thresh", "Threshold", 127, 0, 255), BoolParam("invert", "Invert output"))),
@@ -248,6 +273,9 @@ IMPLEMENTATIONS = {
     "closing": morphology.closing,
     "gradient": morphology.gradient,
     "hit_or_miss": morphology.hit_or_miss,
+    "top_hat": morphology.top_hat,
+    "black_hat": morphology.black_hat,
+    "hat_correction": morphology.hat_correction,
 }
 
 

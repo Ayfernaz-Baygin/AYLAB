@@ -1,4 +1,7 @@
-"""İkili (binary) morfolojik işlemler — Gonzalez & Woods / COMP 4360 Chapter 4.
+"""Morfolojik işlemler — Gonzalez & Woods / COMP 4360 Chapter 4.
+
+İkili işlemler (erosion, dilation, opening, closing, gradient, hit-or-miss) ve
+gri ton top-hat / black-hat (dosyanın sonundaki bölüm; eşikleme yapılmaz).
 
 Görüntü bir küme olarak ele alınır: A = { (x, y) | f(x, y) = ön plan }.
 Yapı elemanı (SE) B, köşe/merkez fark etmeksizin seçilebilen bir orijine
@@ -40,7 +43,14 @@ from numbers import Integral
 import cv2
 import numpy as np
 
-from processing.common import check_image, luminance, match_layout, round_to_uint8
+from processing.common import (
+    check_image,
+    luminance,
+    match_layout,
+    merge_alpha,
+    round_to_uint8,
+    split_alpha,
+)
 from processing.filters import validate_ksize
 from processing.registry import AlgorithmParameterError
 
@@ -273,6 +283,115 @@ def hit_or_miss_mask(mask: np.ndarray, kernel: np.ndarray) -> np.ndarray:
     if b2.any():  # Aᶜ: görüntü dışı arka plan → tümleyende ön plan
         result &= _crop(_erode_raw(_pad(~a, p, 1), StructuringElement(b2, anchor)), p, a.shape)
     return result
+
+
+# --------------------------------------------------------------------------
+# Gri ton morfoloji (düz SE) — Top-hat / Black-hat (slayt 43–47, 82–85)
+# --------------------------------------------------------------------------
+#
+#   [f ⊖ b](z) = min_{s∈b} f(z + s)        [f ⊕ b](z) = max_{s∈b} f(z − s)
+#   f ∘ b = (f ⊖ b) ⊕ b                     f • b = (f ⊕ b) ⊖ b
+#   T_hat(f) = f − (f ∘ b)                  B_hat(f) = (f • b) − f
+#
+# Sınır (dersin laboratuvar sayfası): görüntü dışındaki pikseller *yok sayılır*;
+# min/max yalnızca görüntü içindeki komşular üzerinden alınır (OpenCV'nin gri
+# erode/dilate varsayılan sınırı). Hesap uint8 kafesinde [0, 255] yapılır:
+# komşuluk tamamen dışarıda kalırsa inf ∅ = 255, sup ∅ = 0 olur. Bu kural ile
+# f ∘ b ≤ f ≤ f • b her pikselde sağlanır; iki dönüşüm de tanım gereği negatif
+# olamaz. (float'ta boş küme ±DBL_MAX üretir; bu yüzden float kullanılmaz.)
+
+
+def _validate_gray(f: np.ndarray) -> np.ndarray:
+    if not isinstance(f, np.ndarray) or f.dtype != np.uint8 or f.ndim != 2 or f.size == 0:
+        raise AlgorithmParameterError("Grayscale morphology expects a non-empty 2-D uint8 array.")
+    return f
+
+
+def gray_erosion(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    """f ⊖ b: düz SE altındaki minimum (görüntü dışı yok sayılır)."""
+    return cv2.erode(_validate_gray(f), se.mask, anchor=se.anchor)
+
+
+def gray_dilation(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    """f ⊕ b: yansıtılmış SE altındaki maksimum (ikili dilation ile aynı yansıma kuralı)."""
+    r = se.reflected()
+    return cv2.dilate(_validate_gray(f), r.mask, anchor=r.anchor)
+
+
+def gray_opening(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    return gray_dilation(gray_erosion(f, se), se)
+
+
+def gray_closing(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    return gray_erosion(gray_dilation(f, se), se)
+
+
+def white_top_hat_values(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    """T_hat(f) = f − (f ∘ b) (int32, ≥ 0)."""
+    return f.astype(np.int32) - gray_opening(f, se).astype(np.int32)
+
+
+def black_hat_values(f: np.ndarray, se: StructuringElement) -> np.ndarray:
+    """B_hat(f) = (f • b) − f (int32, ≥ 0)."""
+    return gray_closing(f, se).astype(np.int32) - f.astype(np.int32)
+
+
+def intensity_channel(image: np.ndarray) -> np.ndarray:
+    """Gri ton morfolojinin uygulandığı kanal (uint8, H×W).
+
+    Gri girdide değerlerin kendisi (eşikleme yok). Renkli girdide BT.601
+    parlaklığı Y = 0.299R + 0.587G + 0.114B, en yakın tamsayıya yuvarlanmış.
+    """
+    check_image(image)
+    return round_to_uint8(luminance(image))
+
+
+def _hat_se(shape, width, height, anchor_x, anchor_y) -> StructuringElement:
+    return structuring_element(shape, width, height, anchor_x, anchor_y)
+
+
+def top_hat(image: np.ndarray, shape: str = "rect", width: int = 15, height: int = 15,
+            anchor_x: int = -1, anchor_y: int = -1) -> np.ndarray:
+    """White top-hat T_hat(f) = f − (f ∘ b): b'den küçük PARLAK ayrıntılar.
+
+    Değerler ölçeklenmeden gösterilir (gerçek yoğunluk farkı). Renkli girdide
+    parlaklık üzerinde hesaplanır; sonuç üç eşit kanal, alfa korunur.
+    """
+    se = _hat_se(shape, width, height, anchor_x, anchor_y)
+    f = intensity_channel(image)
+    return match_layout(white_top_hat_values(f, se).astype(np.uint8), image)
+
+
+def black_hat(image: np.ndarray, shape: str = "rect", width: int = 15, height: int = 15,
+              anchor_x: int = -1, anchor_y: int = -1) -> np.ndarray:
+    """Black-hat B_hat(f) = (f • b) − f: b'den küçük KOYU ayrıntılar (ölçeklenmeden)."""
+    se = _hat_se(shape, width, height, anchor_x, anchor_y)
+    f = intensity_channel(image)
+    return match_layout(black_hat_values(f, se).astype(np.uint8), image)
+
+
+def hat_correction(image: np.ndarray, shape: str = "rect", width: int = 15, height: int = 15,
+                   anchor_x: int = -1, anchor_y: int = -1) -> np.ndarray:
+    """corrected = img + top_hat − black_hat (slayt 47), int32'de hesaplanıp [0, 255]'e kırpılır.
+
+    Aynı SE ile: parlak ayrıntılar daha parlak, koyu ayrıntılar daha koyu olur
+    (yerel kontrast artar). Renkli girdide T_hat ve B_hat parlaklık Y üzerinden
+    hesaplanır ve Δ = T_hat − B_hat her kanala eşit eklenir: ağırlıkların toplamı
+    1 olduğundan Y' = Y + Δ olur ve renklilik (B − Y, R − Y) değişmez — YCbCr'de
+    yalnızca Y'yi değiştirmekle aynıdır. Kırpma, doygun piksellerde tonu az
+    miktarda kaydırabilir. Alfa korunur.
+    """
+    se = _hat_se(shape, width, height, anchor_x, anchor_y)
+    f = intensity_channel(image)
+    delta = white_top_hat_values(f, se) - black_hat_values(f, se)
+    color, alpha = split_alpha(image)
+    if color.ndim == 2:
+        out = f.astype(np.int32) + delta
+    elif color.shape[2] == 1:
+        out = (f.astype(np.int32) + delta)[:, :, None]
+    else:
+        out = color.astype(np.int32) + delta[:, :, None]
+    return merge_alpha(np.clip(out, 0, 255).astype(np.uint8), alpha)
 
 
 # --------------------------------------------------------------------------
