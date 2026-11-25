@@ -10,7 +10,7 @@ Dalga boyları: yedi kategori görünür spektrumu kırmızıdan (680 nm) mora
 
 from __future__ import annotations
 
-from processing import filters, intensity
+from processing import filters, intensity, morphology
 from processing.registry import (
     Algorithm,
     AlgorithmRegistry,
@@ -27,14 +27,30 @@ _INTERPOLATION = ChoiceParam(
     (("nearest", "Nearest"), ("linear", "Linear"), ("cubic", "Cubic")),
     "linear",
 )
-_KERNEL_SHAPE = ChoiceParam(
-    "shape",
-    "Structuring element",
-    (("rect", "Rect"), ("ellipse", "Ellipse"), ("cross", "Cross")),
-    "rect",
+# 04 — Morfoloji: ortak parametreler (ikili görüntü + yapı elemanı)
+_BINARY_INPUT = (
+    ChoiceParam("binarize", "Binarization", (("otsu", "Otsu"), ("manual", "Manual")), "otsu",
+                help="How the input becomes the binary set A. OTSU chooses T automatically; "
+                     "MANUAL uses T below. Color images use luminance Y = 0.299R + 0.587G + 0.114B."),
+    IntParam("thresh", "Manual · threshold T", 127, 0, 255, help="MANUAL only."),
+    ChoiceParam("foreground", "Foreground", (("bright", "Bright"), ("dark", "Dark")), "bright",
+                help="BRIGHT: object = Y > T.  DARK: object = Y ≤ T (dark objects on a light "
+                     "background, e.g. cells or text)."),
 )
-_KERNEL = IntParam("ksize", "Kernel size", 3, 1, 31, odd_only=True, suffix="px")
-_ITERATIONS = IntParam("iterations", "Iterations", 1, 1, 10)
+_STRUCTURING_ELEMENT = (
+    ChoiceParam("shape", "SE shape", (("rect", "Rectangle"), ("ellipse", "Ellipse"), ("cross", "Cross")), "rect",
+                help="RECTANGLE: all ones (width = height → square).  ELLIPSE: inscribed disk.  "
+                     "CROSS: centre row + centre column."),
+    IntParam("width", "SE width", 3, 1, 31, odd_only=True, suffix="px"),
+    IntParam("height", "SE height", 3, 1, 31, odd_only=True, suffix="px",
+             help="1 × k or k × 1 gives a line SE (directional morphology)."),
+    IntParam("anchor_x", "Anchor X · origin column", -1, -1, 30,
+             help="−1 = centre. Otherwise 0 … width − 1 (left = 0)."),
+    IntParam("anchor_y", "Anchor Y · origin row", -1, -1, 30,
+             help="−1 = centre. Otherwise 0 … height − 1 (top = 0)."),
+)
+_MORPH = _BINARY_INPUT + _STRUCTURING_ELEMENT
+_ITERATIONS = IntParam("iterations", "Iterations", 1, 1, 10, help="Applies the operation n times with the same SE.")
 
 CATEGORIES: tuple[Category, ...] = (
     Category("transform", 1, "Image Transformations", "Geometry · resampling", 680),
@@ -132,15 +148,44 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                                 "SIGNED: 0 → mid-gray, so zero-crossings are visible."))),
     Algorithm("unsharp", "Unsharp Masking", "spatial", "Adds back the difference from a blurred copy.",
               (FloatParam("amount", "Amount", 1.0, 0.0, 5.0), FloatParam("sigma", "Sigma σ", 1.5, 0.1, 10.0))),
-    # 04 — Morphological Processing
-    Algorithm("erode", "Erosion", "morphology", "Shrinks bright regions.", (_KERNEL_SHAPE, _KERNEL, _ITERATIONS)),
-    Algorithm("dilate", "Dilation", "morphology", "Grows bright regions.", (_KERNEL_SHAPE, _KERNEL, _ITERATIONS)),
-    Algorithm("opening", "Opening", "morphology", "Erosion followed by dilation; removes specks.",
-              (_KERNEL_SHAPE, _KERNEL)),
-    Algorithm("closing", "Closing", "morphology", "Dilation followed by erosion; fills gaps.",
-              (_KERNEL_SHAPE, _KERNEL)),
-    Algorithm("gradient", "Morphological Gradient", "morphology", "Dilation minus erosion: object outlines.",
-              (_KERNEL_SHAPE, _KERNEL)),
+    # 04 — Morphological Processing (binary; pixels outside the image are background)
+    Algorithm("erode", "Erosion", "morphology",
+              "A ⊖ B = { z | (B)z ⊆ A }: a pixel stays foreground only if the whole SE, placed at its "
+              "origin, FITS inside the object. Shrinks objects, removes specks, separates touching shapes.",
+              _MORPH + (_ITERATIONS,)),
+    Algorithm("dilate", "Dilation", "morphology",
+              "A ⊕ B = { z | (B̂)z ∩ A ≠ ∅ }: a pixel becomes foreground if the reflected SE HITS the "
+              "object. Grows objects, bridges gaps, fills small holes.",
+              _MORPH + (_ITERATIONS,)),
+    Algorithm("opening", "Opening", "morphology",
+              "A ∘ B = (A ⊖ B) ⊕ B — erosion, then dilation. Removes objects and protrusions smaller "
+              "than the SE while keeping the shape of larger ones. Idempotent.",
+              _MORPH),
+    Algorithm("closing", "Closing", "morphology",
+              "A • B = (A ⊕ B) ⊖ B — dilation, then erosion. Fills holes and gaps smaller than the SE "
+              "without growing the objects overall. Idempotent; A ⊆ A • B.",
+              _MORPH),
+    Algorithm("gradient", "Morphological Gradient", "morphology",
+              "(A ⊕ B) − (A ⊖ B): the band between dilation and erosion — a shape-based, non-linear "
+              "edge detector that outlines every object.",
+              _MORPH),
+    Algorithm("hit_or_miss", "Hit-or-Miss Transform", "morphology",
+              "A ⊛ B = (A ⊖ B1) ∩ (Aᶜ ⊖ B2): marks positions where the 3 × 3 pattern matches exactly — "
+              "B1 (1) must be foreground, B2 (−1) must be background, 0 = don't care.",
+              _BINARY_INPUT + (
+                  ChoiceParam("pattern", "Pattern",
+                              (("corner", "Upper-right corner · slide 38b"), ("edge", "Right edge · slide 38c"),
+                               ("hole", "Isolated hole · slide 38a"), ("cv_example", "OpenCV example · slide 39"),
+                               ("isolated", "Isolated point"), ("end_point", "Line end · east")), "corner",
+                              help="corner [−1 −1 −1; 1 1 −1; 1 1 −1]   edge [0 0 −1; 1 1 −1; 0 0 −1]   "
+                                   "hole [1 1 1; 1 −1 1; 1 1 1]"),
+                  ChoiceParam("rotation", "Rotate pattern",
+                              (("0", "0°"), ("90", "90°"), ("180", "180°"), ("270", "270°")), "0",
+                              help="Counter-clockwise; e.g. the upper-right corner rotated 90° finds "
+                                   "upper-left corners."),
+                  ChoiceParam("display", "Display", (("matches", "Matches"), ("overlay", "On shape")), "matches",
+                              help="MATCHES: matched positions only (255).  ON SHAPE: matches 255 drawn "
+                                   "over the binary shape in dark gray (70)."))),
     # 05 — Image Segmentation
     Algorithm("threshold", "Global Threshold", "segmentation", "Binary split at a fixed intensity.",
               (IntParam("thresh", "Threshold", 127, 0, 255), BoolParam("invert", "Invert output"))),
@@ -197,6 +242,12 @@ IMPLEMENTATIONS = {
     "sobel_x": filters.sobel_x,
     "sobel_y": filters.sobel_y,
     "laplacian": filters.laplacian,
+    "erode": morphology.erode,
+    "dilate": morphology.dilate,
+    "opening": morphology.opening,
+    "closing": morphology.closing,
+    "gradient": morphology.gradient,
+    "hit_or_miss": morphology.hit_or_miss,
 }
 
 
