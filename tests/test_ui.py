@@ -66,8 +66,8 @@ def test_selecting_algorithm_builds_dynamic_form(window):
     assert window.telemetry.algorithm.value() == algo.title
 
     # Başka algoritmaya geçince form yeniden kurulur
-    window.navigator.select_algorithm("adaptive")
-    assert list(window.parameters.controls) == ["method", "block", "c"]
+    window.navigator.select_algorithm("adaptive_mean")
+    assert list(window.parameters.controls) == ["block", "c", "foreground"]
     assert window.navigator.current_category() == "segmentation"
 
 

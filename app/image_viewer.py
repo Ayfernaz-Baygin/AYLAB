@@ -32,6 +32,7 @@ MIN_ZOOM = 0.02
 MAX_ZOOM = 40.0
 ZOOM_STEP = 1.25
 PIXEL_GRID_ZOOM = 12.0  # Bu ölçeğin üstünde piksel sınırları çizilir
+CLICK_SLOP = 4.0  # px: basma ile bırakma arası bundan az hareket "tıklama" sayılır (sürükleme değil)
 
 
 def ndarray_to_qimage(image: np.ndarray) -> QImage:
@@ -82,6 +83,7 @@ class ImageViewer(QWidget):
     zoom_changed = Signal(float)
     cursor_info = Signal(str)
     file_dropped = Signal(str)
+    pixel_clicked = Signal(int, int)  # x, y — sürüklemeden sol tıklama (ör. Region Growing tohumu)
 
     def __init__(self, title: str = "", parent=None, *, tag: str = "", caption: str = "",
                  empty_hint: str = "", tagline: str = "") -> None:
@@ -105,6 +107,7 @@ class ImageViewer(QWidget):
         self._center = QPointF(0.5, 0.5)
         self._drag_origin: QPointF | None = None
         self._drag_center = QPointF(0.5, 0.5)
+        self._press_pos: QPointF | None = None
         self._hover_px: tuple[int, int] | None = None
 
         self._grid_brush = QBrush(_dot_grid_tile())
@@ -531,6 +534,7 @@ class ImageViewer(QWidget):
         else:
             self._drag_origin = pos
             self._drag_center = QPointF(self._center)
+            self._press_pos = pos
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
@@ -561,9 +565,20 @@ class ImageViewer(QWidget):
         self._update_hover(pos)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        press, self._press_pos = self._press_pos, None
         self._drag_origin = None
         self._dragging_split = False
         self.setCursor(Qt.CursorShape.CrossCursor)
+        if press is None or event.button() != Qt.MouseButton.LeftButton or self._array is None:
+            return
+        pos = event.position()
+        if abs(pos.x() - press.x()) + abs(pos.y() - press.y()) > CLICK_SLOP:
+            return  # kaydırma (sürükleme) — tıklama değil
+        pt = self._widget_to_image(pos)
+        x, y = int(math.floor(pt.x())), int(math.floor(pt.y()))
+        h, w = self._array.shape[:2]
+        if 0 <= x < w and 0 <= y < h:
+            self.pixel_clicked.emit(x, y)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         if self._pixmap is None:

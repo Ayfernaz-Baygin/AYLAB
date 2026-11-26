@@ -44,6 +44,7 @@ class CompareStage(QWidget):
     cursor_info = Signal(str)
     file_dropped = Signal(str)
     mode_changed = Signal(str)
+    pixel_clicked = Signal(int, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -123,6 +124,7 @@ class CompareStage(QWidget):
             src.view_changed.connect(lambda z, f, c, d=dst: self._sync(d, z, f, c))
             src.cursor_info.connect(self.cursor_info)
             src.file_dropped.connect(self.file_dropped)
+            src.pixel_clicked.connect(self.pixel_clicked)
         self.result_viewer.zoom_changed.connect(self._on_zoom)
         self.original_viewer.zoom_changed.connect(self._on_zoom_from_original)
         self._set_tools_enabled(False)

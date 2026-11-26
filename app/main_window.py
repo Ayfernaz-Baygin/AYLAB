@@ -104,6 +104,7 @@ class MainWindow(QMainWindow):
         self.stage.zoom_changed.connect(self.telemetry.set_zoom)
         self.stage.cursor_info.connect(self.telemetry.set_cursor)
         self.stage.file_dropped.connect(self.load_image)
+        self.stage.pixel_clicked.connect(self._on_pixel_clicked)
 
         self._apply_accent(self.accent, None)
         self._set_image_loaded(False)
@@ -285,6 +286,20 @@ class MainWindow(QMainWindow):
         self.parameters.set_algorithm(None)
         self.telemetry.set_algorithm(None)
         self._apply_accent(theme.wavelength_color(category.wavelength), category.wavelength)
+
+    def _on_pixel_clicked(self, x: int, y: int) -> None:
+        """Tohum parametreli işlemde (Region Growing) tıklanan pikseli Seed x / Seed y yapar; Apply ile çalışır."""
+        controls = self.parameters.controls
+        if self.current_image is None or "seed_x" not in controls or "seed_y" not in controls:
+            return
+        h, w = self.current_image.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        controls["seed_x"].set_value(x)
+        controls["seed_y"].set_value(y)
+        if "seeds" in controls:
+            controls["seeds"].set_value("point")
+        self.statusBar().showMessage(f"Seed set to ({x}, {y}) — press Apply to grow the region.", 8000)
 
     def _on_algorithm_selected(self, key: str) -> None:
         algorithm = self.registry.get(key)

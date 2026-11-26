@@ -10,7 +10,7 @@ Dalga boyları: yedi kategori görünür spektrumu kırmızıdan (680 nm) mora
 
 from __future__ import annotations
 
-from processing import filters, intensity, morphology
+from processing import filters, intensity, morphology, segmentation
 from processing.registry import (
     Algorithm,
     AlgorithmRegistry,
@@ -38,6 +38,43 @@ _BINARY_INPUT = (
                 help="BRIGHT: object = Y > T.  DARK: object = Y ≤ T (dark objects on a light "
                      "background, e.g. cells or text)."),
 )
+
+
+# 05 — Segmentasyon / eşikleme: ortak parametreler (sınırlar laboratuvar kontrolleriyle aynı)
+_SEG_FOREGROUND = ChoiceParam(
+    "foreground", "Foreground", (("bright", "Bright · f > T"), ("dark", "Dark · f ≤ T")), "bright",
+    help="BRIGHT: object (255) where f > T.  DARK: object where f ≤ T, e.g. dark text on paper — the "
+         "complement (inverted mask). Color images use luminance Y = 0.299R + 0.587G + 0.114B.")
+_SEG_WINDOW = IntParam("window", "Window", 15, *segmentation.BLOCK_RANGE, odd_only=True, suffix="px",
+                       help="Side of the square window that gives m and s (odd).")
+_SEG_K = FloatParam("k", "k", 0.2, *segmentation.K_RANGE, step=0.01, decimals=2)
+
+
+# 05 — Segmentasyon / kenar tabanlı: ortak parametreler
+def _edge_threshold(default: float = 0.3, lo: float = 0.05, label: str = "Edge threshold · T / max M") -> FloatParam:
+    return FloatParam("t", label, default, lo, 1.0, step=0.01, decimals=2,
+                      help="EDGES display: pixels with M ≥ T · max M (fraction of the largest magnitude).")
+
+
+def _gradient_params() -> tuple:
+    return (
+        ChoiceParam("display", "Display", (("magnitude", "Magnitude M"), ("gx", "gx"), ("gy", "gy"),
+                                           ("direction", "Direction α"), ("edges", "Edges M ≥ T")), "magnitude",
+                    help="M: scaled min–max.  gx / gy: signed, 128 = 0 (x points right, y down).  "
+                         "DIRECTION: hue = α = atan2(gy, gx), brightness = M.  EDGES: binary M ≥ T."),
+        ChoiceParam("magnitude", "Magnitude", (("l2", "√(gx² + gy²)"), ("abs", "|gx| + |gy|")), "l2"),
+        ChoiceParam("smoothing", "Pre-smoothing", (("none", "None"), ("gauss5", "5×5 Gaussian")), "none",
+                    help="5×5 GAUSSIAN (σ = 1.1) before the derivative, as in the lab — reduces noise edges."),
+        _edge_threshold(),
+    )
+
+
+def _seg_block_params() -> tuple:
+    return (IntParam("block", "Block size b", 15, *segmentation.BLOCK_RANGE, odd_only=True, suffix="px",
+                     help="Side of the neighbourhood (odd)."),
+            IntParam("c", "C · subtracted from the mean", 7, *segmentation.C_RANGE,
+                     help="Larger C lowers T(x, y): more pixels pass f > T."),
+            _SEG_FOREGROUND)
 
 
 def _se_params(size: int = 3) -> tuple:
@@ -368,15 +405,263 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                               "gradient", help="Inspect the two terms separately: g = (f ⊕ b) − (f ⊖ b). The status "
                                                "bar lists the mean of both."),
               )),
-    # 05 — Image Segmentation
-    Algorithm("threshold", "Global Threshold", "segmentation", "Binary split at a fixed intensity.",
-              (IntParam("thresh", "Threshold", 127, 0, 255), BoolParam("invert", "Invert output"))),
-    Algorithm("otsu", "Otsu Threshold", "segmentation", "Chooses the threshold that best separates classes.",
-              (BoolParam("invert", "Invert output"),)),
-    Algorithm("adaptive", "Adaptive Threshold", "segmentation", "Local thresholds for uneven lighting.",
-              (ChoiceParam("method", "Method", (("mean", "Mean"), ("gaussian", "Gaussian")), "gaussian"),
-               IntParam("block", "Block size", 11, 3, 99, odd_only=True, suffix="px"),
-               IntParam("c", "Constant C", 2, -20, 20))),
+    # 05 — Image Segmentation · Thresholding (slides 7–17, Chapter 5 lab)
+    Algorithm("threshold", "Manual / Fixed Threshold", "segmentation",
+              "g(x, y) = 1 if f(x, y) > T, 0 otherwise — one threshold for the whole image. Works when object "
+              "and background occupy different intensity ranges; noise widens the histogram modes until no "
+              "single T separates them (slide 9).",
+              (IntParam("thresh", "Threshold T", 127, 0, 255),
+               _SEG_FOREGROUND)),
+    Algorithm("iterative_threshold", "Automatic Global Threshold", "segmentation",
+              "Iterative threshold selection (slide 11): choose T₀, split the image, take the means μ₁ (f > T) "
+              "and μ₂ (f ≤ T), set T = (μ₁ + μ₂) / 2 and repeat until T changes by less than ΔT (at most "
+              "100 iterations). Converges quickly when the histogram has two clear modes.",
+              (ChoiceParam("init", "Initial T₀", (("mean", "Image mean"), ("custom", "Chosen value")), "mean",
+                           help="IMAGE MEAN: T₀ = average intensity.  CHOSEN VALUE: T₀ from the slider below."),
+               IntParam("t0", "T₀ · chosen value", 127, segmentation.T0_RANGE[0], segmentation.T0_RANGE[1],
+                        help="CHOSEN VALUE only."),
+               FloatParam("delta", "Stop when |ΔT| <", 0.5, *segmentation.DELTA_T_RANGE, step=0.1, decimals=1),
+               _SEG_FOREGROUND)),
+    Algorithm("otsu", "Otsu's Method", "segmentation",
+              "T* = argmax σ²_B(k), σ²_B(k) = (m_G·ω₀ − m)² / (ω₀(1 − ω₀)): tries every threshold k and keeps "
+              "the one that makes the two classes most separable (slides 12–13). Needs only the histogram; "
+              "robust for bimodal histograms. Heavy noise merges the modes — smoothing first helps. A uniform "
+              "image has σ²_B ≡ 0 and gives T* = 0.",
+              (_SEG_FOREGROUND,)),
+    Algorithm("adaptive_mean", "Adaptive Mean Threshold", "segmentation",
+              "T(x, y) = mean of the b × b block around (x, y) − C: every pixel gets its own threshold, so "
+              "the decision follows uneven lighting (slides 14–15). Image border: reflected without "
+              "repeating the edge pixel (reflect-101).",
+              _seg_block_params()),
+    Algorithm("adaptive_gaussian", "Adaptive Gaussian Threshold", "segmentation",
+              "T(x, y) = Gaussian-weighted mean of the b × b block − C, σ = 0.3·((b − 1)/2 − 1) + 0.8 (as in "
+              "OpenCV). Nearer pixels count more than in the plain mean (slides 14–15). Border: reflect-101. "
+              "Small differences to cv2.adaptiveThreshold are possible: OpenCV rounds the mean to 8 bits and "
+              "repeats the edge pixel.",
+              _seg_block_params()),
+    Algorithm("moving_average", "Moving Averages Threshold", "segmentation",
+              "g = 1 if f > c · m, m = mean of the last n pixels along a zigzag scan (even rows left → right, "
+              "odd rows right → left, continuing across rows; slide 16, Gonzalez n = 20, c = 0.5). Very cheap; "
+              "suited to text under spotlight or shading. The first n − 1 scanned pixels use the mean of the "
+              "pixels seen so far.",
+              (IntParam("n", "n · pixels averaged", 20, *segmentation.MOVING_N_RANGE),
+               FloatParam("c", "c · fraction of the mean", 0.5, *segmentation.MOVING_C_RANGE, step=0.01, decimals=2),
+               _SEG_FOREGROUND)),
+    Algorithm("niblack", "Niblack Threshold", "segmentation",
+              "T(x, y) = m − k·s, m and s: mean and standard deviation of the window (slide 17, scikit-image "
+              "convention). Follows every local variation, so flat noisy background turns into specks. "
+              "Border: reflect-101.",
+              (_SEG_WINDOW, _SEG_K, _SEG_FOREGROUND)),
+    Algorithm("sauvola", "Sauvola Threshold", "segmentation",
+              "T(x, y) = m · (1 + k · (s / R − 1)), R: dynamic range of s (slide 17). Where s is small (flat "
+              "background) T drops below m, so the background stays clean. Border: reflect-101.",
+              (_SEG_WINDOW, _SEG_K,
+               IntParam("r", "R · dynamic range of s", 128, *segmentation.R_RANGE),
+               _SEG_FOREGROUND)),
+    # 05 — Image Segmentation · Edge-based (slides 18–28, Chapter 5 lab)
+    Algorithm("edge_discontinuity", "Discontinuities & Derivatives", "segmentation",
+              "Edge-based segmentation looks for abrupt intensity changes (slides 18–19). First derivative "
+              "f′(x) = f(x+1) − f(x): non-zero along ramps, a single response at a step. Second derivative "
+              "f″(x) = f(x+1) + f(x−1) − 2f(x): a double (+/−) response at edges, zero on ramps — strongest on "
+              "isolated points and thin lines. Undefined end values are left at 0.",
+              (ChoiceParam("order", "Derivative", (("first", "First · f′"), ("second", "Second · f″")), "first"),
+               ChoiceParam("axis", "Direction", (("horizontal", "Along rows (x)"), ("vertical", "Along columns (y)")),
+                           "horizontal"),
+               ChoiceParam("display", "Display", (("signed", "Signed · 128 = 0"), ("abs", "Absolute")), "signed"))),
+    Algorithm("edge_point", "Point Detection", "segmentation",
+              "R = Σ w·f with the 8-neighbour Laplacian kernel [1 1 1; 1 −8 1; 1 1 1]; g = 1 if |R| ≥ T "
+              "(slide 20). An isolated point differs from all eight neighbours, so |R| is largest there. "
+              "T is a fraction of max |R| (Gonzalez Fig. 10.4: 90 %). A flat image has R ≡ 0 and gives no points.",
+              (FloatParam("t", "T / max |R|", 0.9, 0.1, 1.0, step=0.01, decimals=2),
+               ChoiceParam("display", "Display", (("detected", "Detected |R| ≥ T"), ("abs", "|R|"),
+                                                  ("signed", "R · signed")), "detected"))),
+    Algorithm("edge_line", "Line Detection", "segmentation",
+              "R = Σ w·f with a direction-tuned kernel (slide 21): a row of 2s along the direction, −1 elsewhere. "
+              "Negative responses (the dark sides of a bright line) are set to 0, then g = 1 if R ≥ T. "
+              "+45° is the ╲ diagonal on screen (Gonzalez: x points down).",
+              (ChoiceParam("direction", "Kernel", (("horizontal", "Horizontal"), ("p45", "+45°"),
+                                                   ("vertical", "Vertical"), ("m45", "−45°")), "p45"),
+               FloatParam("t", "T / max R", 0.6, 0.1, 1.0, step=0.01, decimals=2),
+               ChoiceParam("display", "Display", (("detected", "R ≥ T"), ("positive", "max(R, 0)"),
+                                                  ("signed", "R signed")), "detected",
+                           help="R ≥ T: detected line pixels.  MAX(R, 0): response with negatives set to 0.  "
+                                "R SIGNED: 128 = 0."))),
+    Algorithm("edge_gradient", "Gradient (First-Order Derivative)", "segmentation",
+              "∇f = (gx, gy), gx = f(x+1, y) − f(x, y), gy = f(x, y+1) − f(x, y) — the forward difference f′ of "
+              "slide 19 along both axes. M(x, y) = √(gx² + gy²) is the edge strength, α = atan2(gy, gx) the "
+              "direction of fastest change; the edge runs perpendicular to α (slide 22). Border: reflect-101.",
+              _gradient_params()),
+    Algorithm("edge_roberts", "Roberts Operator", "segmentation",
+              "2 × 2 cross-differences (slide 23): gx = f(x+1, y+1) − f(x, y), gy = f(x, y+1) − f(x+1, y). "
+              "Smallest support, most sensitive to noise. M and α as for the gradient.",
+              _gradient_params()),
+    Algorithm("edge_sobel", "Sobel Operator", "segmentation",
+              "3 × 3 kernels with the centre row/column weighted 2 (slide 23): wx = [−1 0 1; −2 0 2; −1 0 1], "
+              "wy = its transpose. The weighting also smooths noise. Slides label the [−1 −2 −1; 0 0 0; 1 2 1] "
+              "kernel gx (x down); here it is wy (x right), as in the lab.",
+              _gradient_params()),
+    Algorithm("edge_prewitt", "Prewitt Operator", "segmentation",
+              "3 × 3 kernels with equal weights (slide 23): wx = [−1 0 1; −1 0 1; −1 0 1], wy = its transpose. "
+              "Simpler than Sobel, slightly less noise suppression.",
+              _gradient_params()),
+    Algorithm("edge_laplacian", "Laplacian", "segmentation",
+              "∇²f with the 4- or 8-neighbour kernel (slides 23–24). Second derivative: a double response at "
+              "edges, zero on flat areas and linear ramps; very sensitive to noise. Edges are the zero "
+              "crossings: opposite neighbours (horizontal, vertical, diagonals) with u·v < 0 and |u − v| > T. "
+              "An ideal one-pixel step gives no crossing under this rule (its + and − responses are adjacent); "
+              "smoothing first (LoG) spreads them.",
+              (ChoiceParam("kernel", "Laplacian kernel", (("4", "4-neighbour"), ("8", "8-neighbour")), "8"),
+               ChoiceParam("display", "Display", (("signed", "∇² · signed"), ("abs", "|∇²|"),
+                                                  ("zero_crossings", "Zero crossings")), "signed"),
+               FloatParam("t", "Zero-crossing T · / max |∇²|", 0.1, 0.0, 0.5, step=0.01, decimals=2,
+                          help="A crossing counts only if |u − v| > T · max |∇²|."))),
+    Algorithm("edge_log", "Laplacian of Gaussian (LoG)", "segmentation",
+              "Marr–Hildreth: ∇²(G_σ ⋆ f) — smooth with a Gaussian (2⌈3σ⌉ + 1 taps), then apply the Laplacian; "
+              "edges are the zero crossings, thin closed contours (slides 23–24). Larger σ suppresses noise and "
+              "fine detail. The threshold on |u − v| removes weak crossings.",
+              (FloatParam("sigma", "σ", 2.0, 0.5, 5.0, step=0.1, decimals=1),
+               ChoiceParam("kernel", "Laplacian kernel", (("4", "4-neighbour"), ("8", "8-neighbour")), "8"),
+               ChoiceParam("display", "Display", (("zero_crossings", "Zero crossings"), ("signed", "LoG · signed")),
+                           "zero_crossings"),
+               FloatParam("t", "Zero-crossing T · / max |∇²|", 0.1, 0.0, 0.5, step=0.01, decimals=2,
+                          help="A crossing counts only if |u − v| > T · max |∇²|."))),
+    Algorithm("edge_canny", "Canny Edge Detector", "segmentation",
+              "Slides 25–26 / lab: (1) Gaussian smoothing σ, (2) Sobel magnitude M (scaled to 0–255) and "
+              "direction, (3) non-maximum suppression across the edge (4 sectors), (4) double threshold: "
+              "M ≥ T₂ strong, T₁ ≤ M < T₂ weak, (5) hysteresis / edge linking: weak pixels are kept only if "
+              "8-connected to a strong one. T₁ must be smaller than T₂. Not identical to cv2.Canny (which "
+              "thresholds the unscaled magnitude). NMS keeps ties (M ≥ both neighbours), so a symmetric step can "
+              "give a 2-pixel-wide edge.",
+              (FloatParam("sigma", "Gaussian σ · 0 = none", 1.4, 0.0, 4.0, step=0.1, decimals=1),
+               IntParam("low", "T₁ · low threshold", 10, 1, 150),
+               IntParam("high", "T₂ · high threshold", 45, 2, 255),
+               ChoiceParam("display", "Display", (("edges", "Edges"), ("nms", "After NMS"),
+                                                  ("double", "Strong / weak"), ("magnitude", "Magnitude M"),
+                                                  ("smoothed", "Smoothed input")), "edges",
+                           help="STRONG / WEAK: strong white, weak orange (before hysteresis)."))),
+    Algorithm("edge_linking", "Edge Linking", "segmentation",
+              "'Thresholding of gradient direction' (slide 27), implemented as the local-processing method of "
+              "Gonzalez & Woods (4th ed., §10.2 — textbook, not detailed in the slides): Sobel M and α; "
+              "g = 1 where M ≥ T_M and |α − A| ≤ T_A; along the edge direction θ, gaps of at most K pixels "
+              "between edge pixels are filled (the book rotates g by θ and scans rows; here the scan follows "
+              "digital lines parallel to θ, without resampling, never leaving the image). θ = 0° horizontal, "
+              "90° vertical, counter-clockwise on screen; A = 90° − θ. BOTH: θ = 0° and 90° combined. Angles are "
+              "compared modulo 180° (edge polarity ignored, 179° ≈ 0°).",
+              (FloatParam("tm", "T_M · / max M", 0.3, 0.05, 1.0, step=0.01, decimals=2),
+               IntParam("ta", "T_A · angle tolerance", 45, 0, 90, suffix="°"),
+               IntParam("k", "K · longest gap filled", 25, 1, 100, suffix="px"),
+               ChoiceParam("orientation", "Edges", (("both", "Both"), ("horizontal", "Horizontal"),
+                                                    ("vertical", "Vertical"), ("angle", "Angle θ")), "both",
+                           help="BOTH: horizontal + vertical.  θ: link along the edge direction set below."),
+               IntParam("angle", "θ · edge direction", 45, 0, 179, suffix="°",
+                        help="Used when Edges = θ. 0° horizontal, 90° vertical, 45° rising to the right (╱), 135° (╲)."),
+               ChoiceParam("display", "Display", (("linked", "Linked"), ("overlay", "Overlay"),
+                                                  ("candidates", "Candidates g")), "linked",
+                           help="OVERLAY: candidate edge pixels white, filled gaps orange."))),
+    Algorithm("edge_boundary", "Boundary Extraction · Contour Tracing", "segmentation",
+              "Closed boundaries of the binary objects (slide 27: 'detect closed contours, form boundary "
+              "representations'), traced with the Moore boundary-following algorithm (Gonzalez & Woods §11.1 — "
+              "textbook): start at the top-left object pixel, search the 8 neighbours clockwise. Each "
+              "8-connected object gives one closed outer boundary; the table lists the objects. (Morphological "
+              "β(A) = A − (A ⊖ B) is in Morphological Processing.)",
+              _BINARY_INPUT + (
+                  ChoiceParam("display", "Display", (("overlay", "Overlay"), ("boundaries", "Boundaries only")),
+                              "overlay", help="OVERLAY: image dimmed, each boundary in its object's colour."),
+              )),
+    Algorithm("edge_hough", "Hough Transform", "segmentation",
+              "Global edge linking (slides 27–28): every Canny edge point (σ = 1.4) votes for each line "
+              "ρ = x cos θ + y sin θ through it, θ = −90° … 89° in 1° steps, ρ in 1-pixel bins. Peaks of the "
+              "accumulator A(ρ, θ) with at least the peak threshold × max votes, local maxima in a ±5 "
+              "neighbourhood, are the detected lines.",
+              (IntParam("low", "Canny T₁", 20, 1, 150),
+               IntParam("high", "Canny T₂", 50, 2, 255),
+               FloatParam("frac", "Peaks · / max votes", 0.5, 0.1, 1.0, step=0.01, decimals=2,
+                          help="A peak needs at least this fraction of the largest vote count (and ≥ 2 votes)."),
+               IntParam("max_lines", "Max lines", 24, 1, 60),
+               ChoiceParam("display", "Display", (("lines", "Lines"), ("accumulator", "A(ρ, θ)"),
+                                                  ("edges", "Edge points")), "lines",
+                           help="LINES: detected lines on the input.  A(ρ, θ): the accumulator — rows = ρ (−D … D), columns = θ (−90° … 89°); size differs "
+                                "from the image."))),
+    # 05 — Segmentasyon / bölge tabanlı (slayt 29–38; laboratuvar growAll, quadtree, watershed, viewMWS)
+    Algorithm("region_growing", "Region Growing", "segmentation",
+              "Slides 30–31 / lab: start from seed points and add neighbours that satisfy an intensity-similarity "
+              "criterion, layer by layer: a neighbour q of a region pixel joins if |f(q) − f(seed)| ≤ T, where "
+              "f(seed) is the value of the seed the region grew from. Stops when no new pixel passes (the region "
+              "has stabilized). POINT: one seed — click the image (A or B) to place it, or type x, y. BRIGHTEST "
+              "(Gonzalez, weld example): the brightest q % of the pixels are seeds; each 8-connected seed group "
+              "grows its own region.",
+              (ChoiceParam("seeds", "Seeds", (("point", "Point · click / x, y"), ("brightest", "Brightest q %")),
+                           "point", help="POINT: single seed at (x, y).  BRIGHTEST: pixels with f ≥ the top-q % "
+                                         "value are seeds (several regions)."),
+               IntParam("seed_x", "Seed x · −1 = centre", -1, -1, segmentation.SEED_COORD_MAX, suffix="px",
+                        help="POINT only. Click the image to set x and y; −1 = image centre."),
+               IntParam("seed_y", "Seed y · −1 = centre", -1, -1, segmentation.SEED_COORD_MAX, suffix="px",
+                        help="POINT only. Must lie inside the image."),
+               FloatParam("q", "Brightest · top q %", 0.3, *segmentation.GROW_Q_RANGE, step=0.05, decimals=2,
+                          suffix="%", help="BRIGHTEST only: seed threshold = the value exceeded by q % of pixels."),
+               IntParam("t", "T · |f(q) − f(seed)| ≤ T", 40, *segmentation.GROW_T_RANGE,
+                        help="Neighbour acceptance threshold (intensity similarity)."),
+               ChoiceParam("connectivity", "Neighbours", (("8", "8-connected"), ("4", "4-connected")), "8"),
+               ChoiceParam("display", "Display", (("overlay", "Overlay"), ("binary", "Binary"), ("labels", "Labels"),
+                                                  ("difference", "|f − f(seed)|")), "overlay",
+                           help="|f − f(seed)| (POINT only): the distance the criterion compares with T."))),
+    Algorithm("region_split_merge", "Region Splitting & Merging", "segmentation",
+              "Slides 32–34 / lab: quadtree — the root is the whole image; a block that fails the predicate Q is "
+              "split into four quadrants (odd sizes give halves that differ by one pixel), down to the minimum "
+              "block; adjacent leaves that are similar are then merged, so regions need not be squares. HOMOG: "
+              "Q = σ ≤ a, merge when the leaf means differ by ≤ the merge threshold. GONZALEZ (Fig. 10.48): "
+              "Q = σ > a and 0 < m < b; as in DIPUM splitmerge, Q = TRUE blocks keep splitting and the Q = TRUE "
+              "leaves form the region (white). Max depth is an AYLAB safety limit (not in the lab).",
+              (ChoiceParam("predicate", "Predicate Q", (("homog", "Homogeneous"), ("gonzalez", "Gonzalez")), "homog",
+                           help="HOMOGENEOUS: Q = σ ≤ a.  GONZALEZ (Fig. 10.48): Q = σ > a and 0 < m < b."),
+               IntParam("a", "a · σ limit", 8, 1, 40),
+               IntParam("b", "b · mean limit", 125, 20, 255, help="GONZALEZ only."),
+               ChoiceParam("min_size", "Min block", tuple((v, f"{v}×{v}") for v in segmentation.SPLIT_MIN_BLOCKS),
+                           "4", help="A block is split only while both sides are ≥ 2 × this size."),
+               IntParam("max_depth", "Max depth", segmentation.SPLIT_MAX_DEPTH, 0, segmentation.SPLIT_MAX_DEPTH,
+                        help="Quadtree levels below the root (0 = no split). 12 never limits images up to 8192 px."),
+               IntParam("merge_t", "Merge if |Δmean| ≤", 12, 0, 60, help="HOMOG only."),
+               ChoiceParam("display", "Display", (("merged", "Merged"), ("split", "Split · quadtree"),
+                                                  ("labels", "Labels")), "merged",
+                           help="MERGED: regions over the leaf means, white borders (GONZALEZ: binary).  SPLIT: "
+                                "each leaf filled with its mean, teal outline."))),
+    Algorithm("region_watershed", "Watershed", "segmentation",
+              "Slides 35–36 / lab: the image is a topographic surface — valleys (regional minima) are basins. "
+              "Water rises from every minimum (priority flooding, 4-neighbours, levels 0 → 255); where water "
+              "from two basins meets, the watershed line is the region boundary. Every regional minimum, also "
+              "one caused by noise, becomes a region: over-segmentation. Smoothing (σ) removes small minima.",
+              (ChoiceParam("surface", "Surface", (("gradient", "Gradient"), ("intensity", "Intensity"),
+                                                  ("inverted", "Inverted")), "gradient",
+                           help="GRADIENT: |∇f| (Sobel), basins = flat areas, lines on edges.  INTENSITY: dark "
+                                "areas are basins.  INVERTED: bright objects are basins."),
+               FloatParam("sigma", "Smoothing σ · 0 = none", 3.0, 0.0, 6.0, step=0.5, decimals=1),
+               ChoiceParam("display", "Display", (("overlay", "Overlay"), ("labels", "Labels"),
+                                                  ("boundaries", "Watershed lines"), ("surface", "Surface"),
+                                                  ("minima", "Regional minima")), "overlay",
+                           help="OVERLAY: basins in colour, watershed lines white.  MINIMA: the markers "
+                                "flooding starts from."))),
+    Algorithm("region_marker_watershed", "Marker-Controlled Watershed", "segmentation",
+              "Slides 37–38, steps as in the lab (OpenCV coins pipeline): (1) gradient surface, (2) internal "
+              "markers — Otsu threshold, opening, distance transform, dist > α · max, one 8-connected marker per "
+              "object, (3) external marker — outside the sure background (dilated opening), (4) watershed "
+              "flooding only from the markers, (5) one region per object; background = label 0. Pixels between "
+              "the markers are 'unknown' and are decided by the flooding.",
+              (_SEG_FOREGROUND,
+               IntParam("open_iter", "Opening · 3×3 iterations", 2, 0, 5,
+                        help="Erode k times, then dilate k times (3×3 square). Removes noise from the Otsu mask."),
+               IntParam("bg_iter", "Sure background · dilations", 3, 0, 10,
+                        help="The opening dilated this many times; everything outside is the external marker."),
+               FloatParam("alpha", "Internal · dist > α · max", 0.5, 0.1, 0.9, step=0.05, decimals=2,
+                          help="Distance-transform threshold for the internal (object) markers."),
+               ChoiceParam("surface", "Surface", (("gradient", "Gradient · σ = 1"),
+                                                  ("distance", "Inverted distance")), "gradient",
+                           help="GRADIENT (slide 37, step 1): Sobel |∇f| after Gaussian σ = 1.  INVERTED "
+                                "DISTANCE (lab default): 255 − dist / max · 255, splits touching round objects."),
+               ChoiceParam("display", "Display", (("overlay", "Overlay"), ("labels", "Labels"),
+                                                  ("boundaries", "Watershed lines"), ("markers", "Markers"),
+                                                  ("binary", "Otsu mask"), ("sure_bg", "Sure background"),
+                                                  ("distance", "Distance"), ("surface", "Surface")), "overlay",
+                           help="MARKERS: internal in colour, external dark, unknown gray."))),
     Algorithm("kmeans", "K-Means Clustering", "segmentation", "Groups pixels into k color clusters.",
               (IntParam("k", "Clusters k", 4, 2, 16), IntParam("attempts", "Attempts", 3, 1, 10))),
     # 06 — Color Processing
@@ -446,6 +731,31 @@ IMPLEMENTATIONS = {
     "gray_opening": morphology.grayscale_opening,
     "gray_closing": morphology.grayscale_closing,
     "gray_gradient": morphology.grayscale_gradient,
+    "threshold": segmentation.manual_threshold,
+    "iterative_threshold": segmentation.automatic_threshold,
+    "otsu": segmentation.otsu_threshold,
+    "adaptive_mean": segmentation.adaptive_mean_threshold,
+    "adaptive_gaussian": segmentation.adaptive_gaussian_threshold,
+    "moving_average": segmentation.moving_average_threshold,
+    "niblack": segmentation.niblack_threshold,
+    "sauvola": segmentation.sauvola_threshold,
+    "edge_discontinuity": segmentation.discontinuity,
+    "edge_point": segmentation.point_detection,
+    "edge_line": segmentation.line_detection,
+    "edge_gradient": segmentation.gradient,
+    "edge_roberts": segmentation.roberts,
+    "edge_sobel": segmentation.sobel,
+    "edge_prewitt": segmentation.prewitt,
+    "edge_laplacian": segmentation.laplacian_edges,
+    "edge_log": segmentation.laplacian_of_gaussian,
+    "edge_canny": segmentation.canny,
+    "edge_linking": segmentation.edge_linking,
+    "edge_boundary": segmentation.boundary_extraction,
+    "edge_hough": segmentation.hough_lines,
+    "region_growing": segmentation.region_growing,
+    "region_split_merge": segmentation.split_and_merge,
+    "region_watershed": segmentation.watershed,
+    "region_marker_watershed": segmentation.marker_controlled_watershed,
 }
 
 
