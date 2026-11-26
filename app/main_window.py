@@ -266,7 +266,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, f"{algorithm.title} failed", str(exc))
             return False
         elapsed_ms = (time.perf_counter() - started) * 1000
-        self.set_processed_image(outcome.image)
+        if outcome.changes_image:                     # ölçüm işlemleri (Color Histogram) B'yi ve geçmişi değiştirmez
+            self.set_processed_image(outcome.image)
         self.parameters.set_report(outcome.report)   # rapor yoksa önceki rapor kalkar
         self.telemetry.set_state("DONE")
         summary = ", ".join(f"{k}={v}" for k, v in resolved.items())
@@ -288,12 +289,30 @@ class MainWindow(QMainWindow):
         self._apply_accent(theme.wavelength_color(category.wavelength), category.wavelength)
 
     def _on_pixel_clicked(self, x: int, y: int) -> None:
-        """Tohum parametreli işlemde (Region Growing) tıklanan pikseli Seed x / Seed y yapar; Apply ile çalışır."""
+        """Tohum parametreli işlemde (Region Growing) tıklanan pikseli Seed x / Seed y yapar; renk parametreli işlemde
+        (Color Slicing, Color Balancing) o pikselin rengini alır. Apply ile çalışır."""
         controls = self.parameters.controls
-        if self.current_image is None or "seed_x" not in controls or "seed_y" not in controls:
+        if self.current_image is None:
             return
         h, w = self.current_image.shape[:2]
         if not (0 <= x < w and 0 <= y < h):
+            return
+        # Renk seçen işlemler (Color Slicing prototipi a, Color Balancing nötr pikseli): rengi B'den (Apply'ın girdisi) al
+        for prefix, method in (("proto", None), ("neutral", "neutral")):
+            keys = [f"{prefix}_{c}" for c in "rgb"]
+            if all(k in controls for k in keys):
+                px = self.current_image[y, x]
+                rgb = [int(px)] * 3 if np.ndim(px) == 0 else ([int(px[0])] * 3 if px.shape[0] < 3 else
+                                                              [int(px[2]), int(px[1]), int(px[0])])  # BGR(A) → RGB
+                for k, v in zip(keys, rgb):
+                    controls[k].set_value(v)
+                if method and "method" in controls:
+                    controls["method"].set_value(method)
+                name = "Prototype color a" if prefix == "proto" else "Neutral pixel"
+                self.statusBar().showMessage(f"{name} = RGB {rgb[0]}, {rgb[1]}, {rgb[2]} picked at ({x}, {y}) — "
+                                             f"press Apply.", 8000)
+                return
+        if "seed_x" not in controls or "seed_y" not in controls:
             return
         controls["seed_x"].set_value(x)
         controls["seed_y"].set_value(y)

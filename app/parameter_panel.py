@@ -24,6 +24,9 @@ from PySide6.QtWidgets import (
 
 from app import theme
 from app.analysis_panel import AnalysisPanel
+from app.color_histogram import ColorHistogramView
+from app.color_curves import TransferCurveView
+from app.color_legend import ColorLegendView
 from app.component_report import ComponentReportView
 from app.controls import ParameterControl, create_control
 from processing.registry import Algorithm, Category
@@ -153,6 +156,12 @@ class ParameterPanel(QScrollArea):
         # --- rapor (yalnızca rapor üreten işlemlerde görünür) --------------
         self.report_view = ComponentReportView()
         root.addWidget(self.report_view)
+        self.color_histogram_view = ColorHistogramView()
+        root.addWidget(self.color_histogram_view)
+        self.color_legend_view = ColorLegendView()
+        root.addWidget(self.color_legend_view)
+        self.transfer_curve_view = TransferCurveView()
+        root.addWidget(self.transfer_curve_view)
 
         # --- analiz -----------------------------------------------------
         self.analysis = AnalysisPanel()
@@ -208,6 +217,12 @@ class ParameterPanel(QScrollArea):
                 control.value_changed.connect(self._on_value_changed)
                 self._form.addWidget(control)
                 self.controls[spec.key] = control
+            for spec in algorithm.params:                 # bağımlı seçenekler (örn. kanal ← renk modeli)
+                parent = self.controls.get(getattr(spec, "depends_on", "") or "")
+                if parent is not None:
+                    child = self.controls[spec.key]
+                    parent.value_changed.connect(lambda _k, v, c=child, s=spec: c.set_options(s.options_for(v)))
+                    child.set_options(spec.options_for(parent.value()))
             self.set_accent(self._surface.accent)
         self._refresh_state()
 
@@ -231,8 +246,11 @@ class ParameterPanel(QScrollArea):
         self.analysis.update_images(current, reference)
 
     def set_report(self, report) -> None:
-        """Son işlemin sayısal raporu (şimdilik ``ComponentReport``) ya da None."""
+        """Son işlemin sayısal raporu (``ComponentReport`` / ``ColorHistogramReport``) ya da None."""
         self.report_view.set_report(report)
+        self.color_histogram_view.set_report(report)
+        self.color_legend_view.set_report(report)
+        self.transfer_curve_view.set_report(report)
 
     # ------------------------------------------------------------------
     def _clear_form(self) -> None:

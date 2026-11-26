@@ -89,16 +89,27 @@ class ChoiceParam:
     options: tuple[tuple[str, str], ...]  # (değer, görünen etiket)
     default: str
     help: str = ""
+    # İsteğe bağlı: seçenekler başka bir parametrenin değerine göre daralır (örn. kanal ← renk modeli).
+    # option_sets = ((üst değer, ((değer, etiket), ...)), ...); her küme ``options``un alt kümesidir.
+    depends_on: str = ""
+    option_sets: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.options:
             raise ValueError(f"{self.key}: en az bir seçenek gerekli")
         if self.default not in self.values:
             raise ValueError(f"{self.key}: default seçeneklerde yok")
+        for parent, opts in self.option_sets:
+            if not opts or not {v for v, _ in opts} <= set(self.values):
+                raise ValueError(f"{self.key}: '{parent}' seçenek kümesi geçersiz")
 
     @property
     def values(self) -> tuple[str, ...]:
         return tuple(v for v, _ in self.options)
+
+    def options_for(self, parent_value: Any) -> tuple[tuple[str, str], ...]:
+        """Üst parametrenin değerine göre geçerli seçenekler (küme yoksa tümü)."""
+        return dict(self.option_sets).get(parent_value, self.options)
 
     def validate(self, value: Any) -> str:
         return value if value in self.values else self.default
@@ -207,6 +218,8 @@ class ProcessResult:
 
     image: np.ndarray
     report: Any = None
+    # False: yalnızca ölçüm (örn. Color Histogram) — arayüz B görüntüsünü ve geri alma geçmişini değiştirmez
+    changes_image: bool = True
 
 
 AlgorithmFunc = Callable[..., Union[np.ndarray, ProcessResult]]

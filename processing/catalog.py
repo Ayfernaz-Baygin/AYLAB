@@ -10,7 +10,7 @@ Dalga boyları: yedi kategori görünür spektrumu kırmızıdan (680 nm) mora
 
 from __future__ import annotations
 
-from processing import filters, intensity, morphology, segmentation
+from processing import color_processing, filters, intensity, morphology, segmentation
 from processing.registry import (
     Algorithm,
     AlgorithmRegistry,
@@ -48,6 +48,14 @@ _SEG_FOREGROUND = ChoiceParam(
 _SEG_WINDOW = IntParam("window", "Window", 15, *segmentation.BLOCK_RANGE, odd_only=True, suffix="px",
                        help="Side of the square window that gives m and s (odd).")
 _SEG_K = FloatParam("k", "k", 0.2, *segmentation.K_RANGE, step=0.01, decimals=2)
+
+
+# 06 — Renk işleme: modeller slayt sırasıyla (24–39)
+_COLOR_MODELS = (("rgb", "RGB"), ("cmy", "CMY"), ("cmyk", "CMYK"), ("hsv", "HSV"), ("hsl", "HSL"), ("hsi", "HSI"),
+                 ("lab", "CIELAB"), ("ycbcr", "YCbCr"))
+_CHANNEL_SETS = tuple((m, tuple((str(k + 1), f"{k + 1} · {s.name}") for k, s in enumerate(color_processing.CHANNELS[m])))
+                      for m in color_processing.MODELS)
+_COLORMAP_CHOICES = tuple((m, color_processing.COLORMAP_NAMES[m]) for m in color_processing.COLORMAPS)
 
 
 # 05 — Segmentasyon / kenar tabanlı: ortak parametreler
@@ -665,20 +673,131 @@ ALGORITHMS: tuple[Algorithm, ...] = (
     Algorithm("kmeans", "K-Means Clustering", "segmentation", "Groups pixels into k color clusters.",
               (IntParam("k", "Clusters k", 4, 2, 16), IntParam("attempts", "Attempts", 3, 1, 10))),
     # 06 — Color Processing
-    Algorithm("color_space", "Color Space Conversion", "color", "Converts between color models.",
-              (ChoiceParam("space", "Target space",
-                           (("gray", "Gray"), ("hsv", "HSV"), ("lab", "Lab"), ("ycrcb", "YCrCb")), "gray"),)),
-    Algorithm("channel", "Channel Isolation", "color", "Shows a single color channel.",
-              (ChoiceParam("channel", "Channel", (("r", "Red"), ("g", "Green"), ("b", "Blue")), "r"),
-               BoolParam("as_gray", "Display as grayscale", True))),
-    Algorithm("hsv_adjust", "HSV Adjust", "color", "Shifts hue and scales saturation / value.",
-              (IntParam("hue", "Hue shift", 0, -90, 90, suffix="°"),
-               FloatParam("saturation", "Saturation", 1.0, 0.0, 3.0, step=0.05),
-               FloatParam("value", "Value", 1.0, 0.0, 3.0, step=0.05))),
-    Algorithm("pseudocolor", "Pseudocolor", "color", "Maps intensities onto a color map.",
-              (ChoiceParam("cmap", "Color map",
-                           (("jet", "Jet"), ("viridis", "Viridis"), ("inferno", "Inferno"),
-                            ("ocean", "Ocean"), ("bone", "Bone")), "viridis"),)),
+    Algorithm("color_space", "Color Space Conversion", "color",
+              "Slides 24–41 / lab: converts RGB to a color model — RGB, CMY (C = 1 − R, slide 29), CMYK "
+              "(K = min(C, M, Y), C′ = (C − K)/(1 − K)), HSV, HSL, HSI (slides 34–35), CIELAB (sRGB → XYZ → "
+              "D65) or YCbCr (OpenCV BT.601). Images are BGR in OpenCV; the conversion uses R, G, B. CHANNELS: "
+              "all channels side by side as gray images (H: H/360·255, a*/b*: +128, inks: 255·(1 − v)). "
+              "ROUND TRIP: RGB → model → RGB, to compare with A; 8-BIT: through the 8-bit channel images "
+              "(quantization error).",
+              (ChoiceParam("model", "Color model", _COLOR_MODELS, "hsv"),
+               ChoiceParam("output", "Output", (("channels", "Channels"), ("roundtrip", "Round trip"),
+                                                ("roundtrip8", "8-bit trip")), "channels",
+                           help="CHANNELS: output is wider than the input (channels + 3 px gaps).  ROUND TRIP: "
+                                "the reconstructed RGB image; the status bar gives the error.  8-BIT TRIP: the "
+                                "round trip through the 8-bit channel images."))),
+    Algorithm("channel", "Channel Visualization", "color",
+              "One channel of a color model as a full-size image, mapped to 0–255 for display (lab rules): "
+              "H 0–360° → H/360·255 (red at both ends), S, V, L, I ×255, L* ×255/100, a*, b* + 128 (128 = "
+              "neutral), C, M, Y, K as printed ink 255·(1 − v), R, G, B, Y, Cb, Cr as they are. Gray pixels have "
+              "no hue; H = 0° there.",
+              (ChoiceParam("model", "Color model", _COLOR_MODELS, "hsv"),
+               ChoiceParam("channel", "Channel", (("1", "1 · R C H L* Y"), ("2", "2 · G M S a* Cb"),
+                                                  ("3", "3 · B Y V/L/I b* Cr"), ("4", "4 · K (CMYK)")), "1",
+                           help="The list follows the color model (e.g. HSV: H, S, V; CMYK: C, M, Y, K).",
+                           depends_on="model", option_sets=_CHANNEL_SETS),
+               ChoiceParam("style", "Style", (("gray", "Gray"), ("tint", "Tinted")), "gray",
+                           help="TINTED (RGB, CMY, CMYK only): the channel in its own color — CMY inks on "
+                                "white paper, as in the lab."))),
+    Algorithm("color_histogram", "Color Histogram", "color",
+              "Slide 42 / lab: one histogram per channel, h_c(k) = number of pixels whose channel value falls "
+              "in bin k, over the channel's real range (R, G, B, Y, Cb, Cr 0–256, H 0–360°, S, V, L, I, C, M, "
+              "Y, K 0–1, L* 0–100, a*, b* −128–128). Shown under COLOR HISTOGRAM; the image is not changed.",
+              (ChoiceParam("model", "Color model", _COLOR_MODELS, "rgb"),
+               ChoiceParam("bins", "Bins", (("256", "256"), ("64", "64"), ("32", "32"), ("16", "16")), "256"),
+               BoolParam("hue_mask", "Hue: chromatic pixels only", False,
+                         help="HSV, HSL, HSI: H counts only pixels with S > 0.15 and V > 0.1 (lab hue "
+                              "histogram); gray pixels have no hue."))),
+    # 06 — pseudo-color (slayt 43–50; laboratuvar Intensity Slicing, Color Coding)
+    Algorithm("intensity_slicing", "Intensity Slicing", "color",
+              "Slides 47–49 / lab: pseudo-color starts from a gray image. The intensity function is cut by "
+              "horizontal slicing planes; every interval V_k between two planes gets its own color: g(x, y) = c_k "
+              "if f(x, y) ∈ V_k. 2 COLORS: one plane l_i — f < l_i → c₁, f ≥ l_i → c₂. 4 / 8 COLORS: planes at "
+              "round(k · 256 / n) (equal intervals, lab). Color images are first converted to Y. The colors are "
+              "artificial; the intervals and colors are listed under COLOR LEGEND.",
+              (ChoiceParam("colors", "Colors", (("2", "2 · one plane"), ("4", "4"), ("8", "8")), "2"),
+               IntParam("plane", "Plane l_i · 2 colors", 128, 1, 255,
+                        help="2 COLORS only: intensities ≥ l_i take c₂."),
+               ChoiceParam("palette", "Slice colors", (("lab", "Lab palette"),) + _COLORMAP_CHOICES, "lab",
+                           help="LAB: the lab's colors (blue / yellow for 2).  A color map (AYLAB option): each "
+                                "slice takes the map's color at the middle of its interval."))),
+    Algorithm("pseudocolor", "Color Coding", "color",
+              "Slides 44, 50 / lab: color coding with a color map — three independent transfer functions "
+              "R = f_R(f), G = f_G(f), B = f_B(f), stored as a 256-entry look-up table: g(x, y) = LUT[f(x, y)]. "
+              "Maps as defined in the lab (piecewise linear stops; HSV: hue 0–300°). They approximate, but do "
+              "not equal, MATLAB / OpenCV maps. Color images are first converted to Y; the color bar is shown "
+              "under COLOR LEGEND.",
+              (ChoiceParam("cmap", "Color map", _COLORMAP_CHOICES, "jet"),)),
+    # 06 — full-color (slayt 51–56; laboratuvar ctrans, cslice, tone, balance, histeq)
+    Algorithm("color_transform", "Color Transformation", "color",
+              "Slides 51–52 (Fig. 6.29) / lab: s_i = T_i(r_1, …, r_n). The same effect — reducing the intensity "
+              "by a factor k — written in different color models: RGB s_i = k·r_i; CMY s_i = k·r_i + (1 − k); "
+              "CMYK (slide figure, not in the lab) only K: s_4 = k·r_4 + (1 − k); HSI only I: s_3 = k·r_3, H and S "
+              "unchanged. The formulas differ, the result does not: the report gives the largest difference from "
+              "the other models (rounding only). Transfer functions are drawn under TRANSFER CURVES.",
+              (ChoiceParam("model", "Color model", (("rgb", "RGB · s_i = k·r_i"), ("cmy", "CMY · s_i = k·r_i + (1 − k)"),
+                                                    ("cmyk", "CMYK · s_4 = k·r_4 + (1 − k)"),
+                                                    ("hsi", "HSI · s_3 = k·r_3")), "rgb",
+                           help="Switch the model with the same k and compare the results (A/B, Undo)."),
+               FloatParam("k", "k · intensity factor", 0.7, *color_processing.TRANSFORM_K_RANGE, step=0.05,
+                          decimals=2, help="Lab: 0.1 … 1; Fig. 6.29 uses k = 0.7 (30 % darker)."))),
+    Algorithm("color_slicing", "Color Slicing", "color",
+              "Slide 53 / lab: highlight a range of colors. Pixels whose color lies inside a cube of width W (or a "
+              "sphere of radius R₀) centred at the prototype color a keep their color; all others become neutral "
+              "gray (0.5, 0.5, 0.5) = 128. CUBE: s_i = 0.5 if |r_j − a_j| > W/2 for any j, else r_i. SPHERE: "
+              "s_i = 0.5 if Σ(r_j − a_j)² > R₀², else r_i. Click the image to pick a (from B, the input of Apply).",
+              (ChoiceParam("shape", "Region", (("cube", "Cube · W"), ("sphere", "Sphere · R₀")), "cube"),
+               IntParam("width", "Cube · width W", 110, *color_processing.SLICE_SIZE_RANGE,
+                        help="CUBE only: keep |r_j − a_j| ≤ W/2 in R, G and B."),
+               IntParam("radius", "Sphere · radius R₀", 80, *color_processing.SLICE_SIZE_RANGE,
+                        help="SPHERE only: keep the Euclidean RGB distance to a ≤ R₀."),
+               IntParam("proto_r", "Prototype a · R", 190, 0, 255, help="Click the image to pick a; lab default "
+                                                                         "a = (190, 25, 45), a strawberry red."),
+               IntParam("proto_g", "Prototype a · G", 25, 0, 255),
+               IntParam("proto_b", "Prototype a · B", 45, 0, 255))),
+    Algorithm("tone_correction", "Tone & Color Corrections", "color",
+              "Slide 54 (Fig. 6.33) / lab: tonal corrections fix contrast and brightness without changing the "
+              "colors — the same transfer function is applied to R, G and B: s_i = T(r_i). FLAT (low contrast) → "
+              "S-curve T = (s(r) − s(0)) / (s(1) − s(0)), s(r) = 1 / (1 + e^(−a(r − 0.5))); too LIGHT → power law "
+              "T(r) = r^γ with γ > 1; too DARK → γ < 1. Lab cases: flat a = 9, light γ = 2, dark γ = 0.45.",
+              (ChoiceParam("curve", "Curve", (("s", "S-curve"), ("gamma", "Power · r^γ")), "s"),
+               FloatParam("strength", "S-curve · strength a", 9.0, *color_processing.TONE_STRENGTH_RANGE, step=0.5,
+                          decimals=1, help="S-CURVE only: steeper mid-tones for larger a (lab 1 … 16)."),
+               FloatParam("gamma", "Power · γ", 1.0, *color_processing.TONE_GAMMA_RANGE, step=0.05, decimals=2,
+                          help="POWER only: γ > 1 darkens (light images), γ < 1 brightens (dark images)."))),
+    Algorithm("color_balance", "Color Balancing", "color",
+              "Slide 55 (Fig. 6.36) / lab: a color cast shifts all colors towards one hue; each channel is scaled "
+              "(or curved) separately so that neutral objects become neutral again — white balance. "
+              "R′ = k_R·R, G′ = k_G·G, B′ = k_B·B. WHITE PATCH: k_c = 255 / max_c. GREY WORLD: k_c = m̄ / m_c "
+              "(m_c channel mean, m̄ their mean). NEUTRAL PIXEL: click a pixel that should be gray; its channels "
+              "become equal. GAINS (AYLAB): k_R, k_G, k_B by hand. CURVES (Fig. 6.36): c′ = 255·(c / 255)^γ_c — "
+              "γ > 1 weakens a channel, γ < 1 strengthens it.",
+              (ChoiceParam("method", "Method", (("white", "White patch · 255 / max"), ("gray", "Grey world · m̄ / m"),
+                                                ("neutral", "Neutral pixel · click"), ("gains", "Channel gains · k_c"),
+                                                ("curves", "Channel curves · γ_c")), "white"),
+               IntParam("neutral_r", "Neutral pixel · R", 128, 0, 255,
+                        help="NEUTRAL only. Click the image to pick the pixel (from B); lab default (128, 128, 128)."),
+               IntParam("neutral_g", "Neutral pixel · G", 128, 0, 255),
+               IntParam("neutral_b", "Neutral pixel · B", 128, 0, 255),
+               FloatParam("gain_r", "Gains · k_R", 1.0, *color_processing.BALANCE_GAIN_RANGE, step=0.01, decimals=2,
+                          help="GAINS only (AYLAB addition): R′ = k_R·R, clipped to 255."),
+               FloatParam("gain_g", "Gains · k_G", 1.0, *color_processing.BALANCE_GAIN_RANGE, step=0.01, decimals=2),
+               FloatParam("gain_b", "Gains · k_B", 1.0, *color_processing.BALANCE_GAIN_RANGE, step=0.01, decimals=2),
+               FloatParam("gamma_r", "Curves · γ_R", 1.0, *color_processing.BALANCE_GAMMA_RANGE, step=0.02, decimals=2,
+                          help="CURVES only (lab 0.4 … 2.5). Heavy in cyan = too little red: γ_R < 1."),
+               FloatParam("gamma_g", "Curves · γ_G", 1.0, *color_processing.BALANCE_GAMMA_RANGE, step=0.02, decimals=2),
+               FloatParam("gamma_b", "Curves · γ_B", 1.0, *color_processing.BALANCE_GAMMA_RANGE, step=0.02,
+                          decimals=2))),
+    Algorithm("hsi_equalization", "Histogram Equalization in HSI", "color",
+              "Slide 56 / lab: convert RGB to HSI, equalize only the intensity I and keep hue H and saturation S: "
+              "(H, S, I) → (H, S, T(I)) → RGB, T(I) = (L − 1)·Σ_{j ≤ I} p_I(j) on I8 = round(255·I). A uniform "
+              "brightness distribution without color shifts (median I → about 0.5). R, G, B SEPARATELY is the "
+              "lab's comparison: three different curves can shift the hues. Saturation × (lab): S′ = min(1, S·×), "
+              "HSI only.",
+              (ChoiceParam("method", "Method", (("hsi", "Equalize I only · HSI"), ("rgb", "R, G, B separately")),
+                           "hsi", help="HSI is the slide-56 method; R, G, B is shown for comparison only."),
+               FloatParam("saturation", "Saturation ×", 1.0, *color_processing.EQ_SAT_RANGE, step=0.05, decimals=2,
+                          help="HSI only (lab 0.5 … 1.6): optional saturation boost after equalizing I."))),
     # 07 — Feature Extraction
     Algorithm("sobel", "Sobel Edges", "features", "First-derivative gradient magnitude.",
               (ChoiceParam("direction", "Direction", (("x", "X"), ("y", "Y"), ("xy", "Magnitude")), "xy"),
@@ -756,6 +875,16 @@ IMPLEMENTATIONS = {
     "region_split_merge": segmentation.split_and_merge,
     "region_watershed": segmentation.watershed,
     "region_marker_watershed": segmentation.marker_controlled_watershed,
+    "color_space": color_processing.color_space_conversion,
+    "channel": color_processing.channel_visualization,
+    "color_histogram": color_processing.color_histogram,
+    "intensity_slicing": color_processing.intensity_slicing,
+    "pseudocolor": color_processing.color_coding,
+    "color_transform": color_processing.color_transformation,
+    "color_slicing": color_processing.color_slicing,
+    "tone_correction": color_processing.tone_correction,
+    "color_balance": color_processing.color_balance,
+    "hsi_equalization": color_processing.hsi_equalization,
 }
 
 

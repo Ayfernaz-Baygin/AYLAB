@@ -171,7 +171,7 @@ class ChoiceControl(ParameterControl):
 
         self.combo: QComboBox | None = None
         self.buttons: dict[str, QPushButton] = {}
-        if len(spec.options) <= self.SEGMENT_LIMIT:
+        if len(spec.options) <= self.SEGMENT_LIMIT and not spec.depends_on:
             row = QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(0)
@@ -211,6 +211,25 @@ class ChoiceControl(ParameterControl):
         else:
             self.buttons[v].setChecked(True)
         self.value_changed.emit(self.spec.key, v)
+
+    def set_options(self, options: tuple[tuple[str, str], ...]) -> None:
+        """Açılır listeyi yeni seçeneklerle doldurur (bağımlı parametre); geçerli değer yoksa ilkine geçer."""
+        if self.combo is None:
+            return
+        current = self._value
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        for value, label in options:
+            self.combo.addItem(label, value)
+        self.combo.blockSignals(False)
+        values = [v for v, _ in options]
+        self.set_value(current if current in values else values[0])
+
+    def values_offered(self) -> list[str]:
+        """Şu anda listede sunulan değerler (test ve doğrulama için)."""
+        if self.combo is None:
+            return list(self.buttons)
+        return [self.combo.itemData(i) for i in range(self.combo.count())]
 
 
 class ToggleSwitch(QAbstractButton):
