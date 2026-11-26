@@ -62,7 +62,8 @@ def test_color_operations_listed(window):
     window.navigator.tiles["color"].click()
     rows = list(window.navigator.operation_rows)
     assert rows[:3] == COLOR_KEYS and rows[3:] == ["intensity_slicing", "pseudocolor",   # + Paket 2
-                                         "color_transform", "color_slicing", "tone_correction", "color_balance", "hsi_equalization"]   # + Paket 3
+                                         "color_transform", "color_slicing", "tone_correction", "color_balance", "hsi_equalization",   # + Paket 3
+                                         "color_smooth_sharpen"]   # + Paket 4
 
 
 @pytest.mark.parametrize("key,values,reference", CASES, ids=[f"{c[0]}-{i}" for i, c in enumerate(CASES)])

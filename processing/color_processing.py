@@ -572,6 +572,7 @@ class FullColorReport:
     curves: tuple[TransferCurve, ...] = ()
     rows: tuple[str, ...] = ()
     swatch: tuple[int, int, int] | None = None
+    section: str = ""                      # sağ panel başlığı (boşsa: eğri varsa TRANSFER CURVES, yoksa COLOR SLICE)
 
     def summary(self) -> str:
         return f"{self.title}: {self.detail}"
@@ -838,3 +839,114 @@ def hsi_equalization(image: np.ndarray, method: str = "hsi", saturation: float =
                                  tuple(TransferCurve(c, CHANNEL_INK[c], luts[j] / 255) for j, c in enumerate("RGB")),
                                  ("Three different curves T_R, T_G, T_B: hues can shift.",))
     return ProcessResult(_out(out, alpha), report)
+
+
+# ====================================================================================================
+# Paket 4: renkli görüntü yumuşatma ve keskinleştirme — slayt 57–58 (Şekil 6.38–6.39), laboratuvar 'Color Image
+# Smoothing & Sharpening'. Komşuluk işlemi her pikseli bir renk vektörü sayar: (a) her RGB kanalı ayrı filtrelenir
+# ya da (b) yalnızca HSI'nın I bileşeni filtrelenir, H ve S korunur. Laboratuvar kuralları aynen: kenarlar
+# tekrarlanır (replicate), filtre çıktısı ve I·255 Float32Array'de saklanır (float32 yuvarlaması), keskinleştirme
+# her zaman 3×3 Laplacian'dır (Kernel seçimi yalnızca yumuşatmaya uygulanır).
+# ====================================================================================================
+SMOOTH_OPERATIONS = ("smooth", "sharpen")
+SMOOTH_KERNELS = ("3", "5")
+SMOOTH_PROCESSES = ("rgb", "hsi")
+SMOOTH_DISPLAYS = ("result", "difference")
+SMOOTH_DIFF_GAIN = 8                                       # laboratuvar: |kanal başına − HSI| × 8
+LAPLACE_SHARPEN = (0, -1, 0, -1, 4, -1, 0, -1, 0)          # laboratuvar LAPL: f + (4f − 4 komşu) = f − ∇²f
+
+
+def _windows(x: np.ndarray, k: int):
+    """k×k pencere elemanları satır sırasıyla (laboratuvar filt: dy, sonra dx), kenarlar tekrarlanır."""
+    r = k // 2
+    p = np.pad(x, r, mode="edge")
+    h, w = x.shape
+    for dy in range(k):
+        for dx in range(k):
+            yield p[dy:dy + h, dx:dx + w]
+
+
+def lab_box(x: np.ndarray, k: int) -> np.ndarray:
+    """Laboratuvar boxFn: pencere toplamı (soldan sağa, çift duyarlık) / k², sonuç float32 saklanır."""
+    acc = np.zeros(x.shape, np.float64)
+    for v in _windows(x.astype(np.float64), k):
+        acc = acc + v
+    return (acc / (k * k)).astype(np.float32)
+
+
+def lab_laplace(x: np.ndarray) -> np.ndarray:
+    """Laboratuvar lapFn: Σ LAPL[i]·w_i (sırayla), = 4·merkez − 4 komşu = −∇²f; float32 saklanır."""
+    acc = np.zeros(x.shape, np.float64)
+    for coef, v in zip(LAPLACE_SHARPEN, _windows(x.astype(np.float64), 3)):
+        acc = acc + coef * v
+    return acc.astype(np.float32)
+
+
+def smooth_sharpen_rgb(rgb: np.ndarray, operation: str, k: int, process: str) -> tuple[np.ndarray, np.ndarray | None]:
+    """Laboratuvar process(): R, G, B ∈ [0, 255] → sonuç R, G, B uint8 (RGB sırası) ve HSI yolunda (H, S, I, I′)."""
+    if process == "rgb":
+        chans = []
+        for c in range(3):
+            g = rgb[..., c]
+            if operation == "smooth":
+                chans.append(lab_box(g, k).astype(np.float64))                    # c̄ = (1/K) Σ c(s, t)
+            else:
+                chans.append(g + lab_laplace(g).astype(np.float64))               # c + (4c − 4 komşu)
+        return c8(np.stack(chans, -1)), None
+    hsi = rgb_to_model(rgb, "hsi")
+    ig = (hsi[..., 2] * 255).astype(np.float32)                                    # laboratuvar Ig (Float32Array)
+    if operation == "smooth":
+        new_i = lab_box(ig, k).astype(np.float64) / 255
+    else:
+        new_i = (ig.astype(np.float64) + lab_laplace(ig).astype(np.float64)) / 255
+    new_i = np.maximum(0, np.minimum(1, new_i))                                    # I′ ∈ [0, 1]
+    out = hsi.copy()
+    out[..., 2] = new_i                                                             # H, S aynen
+    return c8(model_to_rgb(out, "hsi")), np.stack([hsi[..., 0], hsi[..., 1], hsi[..., 2], new_i], -1)
+
+
+def smoothing_difference(rgb_result: np.ndarray, hsi_result: np.ndarray) -> np.ndarray:
+    """Laboratuvar D: c8(8 · max_c |RGB_c − HSI_c|) — tek kanallı fark görüntüsü."""
+    d = np.abs(rgb_result.astype(np.int16) - hsi_result.astype(np.int16)).max(axis=-1)
+    return c8(d * SMOOTH_DIFF_GAIN)
+
+
+def color_smoothing_sharpening(image: np.ndarray, operation: str = "smooth", kernel: str = "3", process: str = "rgb",
+                               display: str = "result") -> ProcessResult:
+    """Color image smoothing & sharpening (slayt 57–58; laboratuvar). SMOOTHING: k×k ortalama,
+    c̄(x, y) = [(1/K) Σ R, (1/K) Σ G, (1/K) Σ B] (her RGB kanalı) ya da yalnızca I. SHARPENING: 3×3 Laplacian,
+    g = f − ∇²f = f + (4f − 4 komşu) her RGB kanalına ya da yalnızca I'ya; I′ [0, 1]'e kırpılır. DIFFERENCE:
+    iki yöntemin farkı c8(8 · max_c |RGB_c − HSI_c|) (laboratuvar), gri olarak gösterilir."""
+    _choice(operation, "Operation", SMOOTH_OPERATIONS)
+    k = int(_choice(kernel, "Kernel", SMOOTH_KERNELS)) if operation == "smooth" else 3
+    if operation == "sharpen":
+        _choice(kernel, "Kernel", SMOOTH_KERNELS)                                   # geçerli olmalı ama kullanılmaz
+    _choice(process, "Process", SMOOTH_PROCESSES)
+    _choice(display, "Display", SMOOTH_DISPLAYS)
+    rgb, alpha = rgb_input(image)
+    by_rgb, _ = smooth_sharpen_rgb(rgb, operation, k, "rgb")
+    by_hsi, hsi = smooth_sharpen_rgb(rgb, operation, k, "hsi")
+    diff = smoothing_difference(by_rgb, by_hsi)
+    raw = np.abs(by_rgb.astype(np.int16) - by_hsi.astype(np.int16)).max(axis=-1)
+    chosen = by_rgb if process == "rgb" else by_hsi
+    shown = np.repeat(diff[..., None], 3, -1) if display == "difference" else chosen
+    name = f"{k}×{k} average" if operation == "smooth" else "3×3 Laplacian sharpening"
+    how = "each RGB channel" if process == "rgb" else "only I of HSI (H, S kept)"
+    detail = (f"{name}, {how}; |RGB − HSI|: max {int(raw.max(initial=0))}, mean {raw.mean():.2f}, "
+              f"{int((raw > 0).sum())} of {raw.size} px differ")
+    if display == "difference":
+        detail = f"difference × {SMOOTH_DIFF_GAIN} = c8(8 · max_c |RGB_c − HSI_c|) of the two methods; " + detail
+    kern = (f"kernel (1/{k * k})·ones({k}×{k}), K = {k * k}" if operation == "smooth"
+            else "kernel [0 −1 0; −1 4 −1; 0 −1 0]: g = f + (4f − 4 neighbours) = f − ∇²f")
+    rows = [kern, "border: replicate (lab); smoothing kernel 3×3 / 5×5, sharpening always 3×3",
+            "c̄ = [(1/K)ΣR, (1/K)ΣG, (1/K)ΣB]" if operation == "smooth" else "∇²c = [∇²R, ∇²G, ∇²B]"]
+    if raw.size:                                                                    # örnek piksel: en büyük fark
+        y, x = np.unravel_index(int(np.argmax(raw)), raw.shape)
+        p, a, b = (tuple(int(v) for v in im[y, x]) for im in (rgb, by_rgb, by_hsi))
+        H, S, I0, I1 = hsi[y, x]
+        rows += [f"pixel ({x}, {y}) RGB {p}: each channel → {a}",
+                 f"  HSI: H {H:.1f}°, S {S:.3f} kept, I {I0:.3f} → {I1:.3f} → {b}"]
+    report = FullColorReport(f"Color {'smoothing' if operation == 'smooth' else 'sharpening'} · "
+                             f"{'RGB' if process == 'rgb' else 'HSI I'}", detail, (), tuple(rows),
+                             section="SMOOTHING & SHARPENING")
+    return ProcessResult(merge_alpha(np.ascontiguousarray(shown[..., ::-1]), alpha), report)

@@ -149,7 +149,7 @@ def rgb_of(result):
 # ================================================================ katalog
 def test_full_color_operations_follow_slide_order():
     keys = [a.key for a in REGISTRY.in_category("color")]
-    assert keys[5:] == FULL_KEYS                                                # slayt 52, 53, 54, 55, 56
+    assert keys[5:10] == FULL_KEYS and keys[10:] == ["color_smooth_sharpen"]   # slayt 52–56, + Paket 4 (57–58)
     assert [REGISTRY.get(k).title for k in FULL_KEYS] == ["Color Transformation", "Color Slicing",
                                                           "Tone & Color Corrections", "Color Balancing",
                                                           "Histogram Equalization in HSI"]

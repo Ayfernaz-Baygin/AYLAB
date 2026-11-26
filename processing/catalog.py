@@ -798,6 +798,23 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                            "hsi", help="HSI is the slide-56 method; R, G, B is shown for comparison only."),
                FloatParam("saturation", "Saturation ×", 1.0, *color_processing.EQ_SAT_RANGE, step=0.05, decimals=2,
                           help="HSI only (lab 0.5 … 1.6): optional saturation boost after equalizing I."))),
+    # 06 — renkli yumuşatma / keskinleştirme (slayt 57–58; laboratuvar smooth)
+    Algorithm("color_smooth_sharpen", "Color Smoothing & Sharpening", "color",
+              "Slides 57–58 (Figs. 6.38–6.39) / lab: neighbourhood operations on color vectors. SMOOTHING: k×k "
+              "average c̄(x, y) = [(1/K) Σ R(s, t), (1/K) Σ G(s, t), (1/K) Σ B(s, t)]. SHARPENING: Laplacian "
+              "g = f − ∇²f = f + (4f − 4 neighbours), kernel [0 −1 0; −1 4 −1; 0 −1 0], always 3×3. EACH RGB "
+              "CHANNEL filters R, G and B separately; ONLY I OF HSI filters the intensity and keeps H and S "
+              "(I′ clipped to [0, 1]). Borders are replicated (lab). DIFFERENCE × 8 shows c8(8·max_c |RGB_c − HSI_c|) "
+              "between the two methods — non-zero only along color edges.",
+              (ChoiceParam("operation", "Operation · average / Laplacian", (("smooth", "Smoothing"),
+                                                                            ("sharpen", "Sharpening")), "smooth",
+                           help="SMOOTHING: k×k average.  SHARPENING: f − ∇²f with the 3×3 Laplacian."),
+               ChoiceParam("kernel", "Kernel · smoothing", (("3", "3×3"), ("5", "5×5 · Fig. 6.38")), "3",
+                           help="SMOOTHING only. Sharpening always uses the 3×3 Laplacian (lab)."),
+               ChoiceParam("process", "Process", (("rgb", "Each RGB channel"), ("hsi", "Only I of HSI")), "rgb"),
+               ChoiceParam("display", "Display", (("result", "Result"), ("difference", "|RGB − HSI| × 8")), "result",
+                           help="RESULT: the chosen process.  |RGB − HSI| × 8: difference of the two processes "
+                                "(gray), as in Figs. 6.38c / 6.39c."))),
     # 07 — Feature Extraction
     Algorithm("sobel", "Sobel Edges", "features", "First-derivative gradient magnitude.",
               (ChoiceParam("direction", "Direction", (("x", "X"), ("y", "Y"), ("xy", "Magnitude")), "xy"),
@@ -885,6 +902,7 @@ IMPLEMENTATIONS = {
     "tone_correction": color_processing.tone_correction,
     "color_balance": color_processing.color_balance,
     "hsi_equalization": color_processing.hsi_equalization,
+    "color_smooth_sharpen": color_processing.color_smoothing_sharpening,
 }
 
 

@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
@@ -290,6 +291,7 @@ class SpectralNavigator(QWidget):
         self._list.setSpacing(0)
         scroll.setWidget(holder)
         root.addWidget(scroll, 1)
+        self._scroll = scroll
 
         self._tile_group = QButtonGroup(self)
         self._tile_group.setExclusive(True)
@@ -341,9 +343,19 @@ class SpectralNavigator(QWidget):
             self.select_category(algo.category)
         row = self.operation_rows[key]
         row.setChecked(True)
+        self._reveal(key)
         if key != self._current_algorithm:
             self._current_algorithm = key
             self.algorithm_selected.emit(key)
+
+    def _reveal(self, key: str) -> None:
+        """Seçili işlem satırını listede görünür alana kaydırır (uzun kategorilerde alttaki işlemler).
+        Yerleşim tamamlandıktan sonra çalışır; satır zaten görünürse liste kımıldamaz."""
+        def run() -> None:
+            row = self.operation_rows.get(key)              # tepsi bu arada yeniden kurulduysa eski satır yok
+            if row is not None and key == self._current_algorithm:
+                self._scroll.ensureWidgetVisible(row, 0, 24)
+        QTimer.singleShot(0, run)
 
     def _rebuild_tray(self, category: Category, tile: CategoryTile) -> None:
         while self._tray_layout.count():

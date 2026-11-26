@@ -107,7 +107,8 @@ class TransferCurveView(QWidget):
             self.hide()
             return
         self.report = report
-        self.title.setText(("TRANSFER CURVES · " if report.curves else "COLOR SLICE · ") + report.title.upper())
+        section = report.section or ("TRANSFER CURVES" if report.curves else "COLOR SLICE")
+        self.title.setText(f"{section} · {report.title.upper()}")
         self.plot.setVisible(bool(report.curves))
         self.plot.set_curves(report.curves)
         if report.swatch is not None:
