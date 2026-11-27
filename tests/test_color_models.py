@@ -51,8 +51,9 @@ def test_color_operations_follow_source_order_and_are_all_implemented():
     keys = [a.key for a in REGISTRY.in_category("color")]
     assert keys == ["color_space", "channel", "color_histogram", "intensity_slicing", "pseudocolor",   # + Paket 2
                     "color_transform", "color_slicing", "tone_correction", "color_balance", "hsi_equalization",   # + Paket 3
-                    "color_smooth_sharpen"]   # + Paket 4
-    assert len(keys) == 11 and all(REGISTRY.get(k).implemented for k in keys)  # yer tutucu kalmadı (hsv_adjust kaldırıldı)
+                    "color_smooth_sharpen",   # + Paket 4
+                    "color_hue_threshold", "color_kmeans", "color_skin", "color_edges"]   # + Paket 5
+    assert len(keys) == 15 and all(REGISTRY.get(k).implemented for k in keys)  # yer tutucu kalmadı (hsv_adjust kaldırıldı)
     assert "hsv_adjust" not in REGISTRY
     assert [REGISTRY.get(k).title for k in COLOR_KEYS] == ["Color Space Conversion", "Channel Visualization",
                                                            "Color Histogram"]

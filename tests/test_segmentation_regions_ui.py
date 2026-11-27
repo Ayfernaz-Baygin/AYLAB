@@ -72,7 +72,7 @@ CASES = [
 def test_region_operations_listed_after_edge_operations(window):
     window.navigator.tiles["segmentation"].click()
     rows = list(window.navigator.operation_rows)
-    assert rows[21:25] == REGION_KEYS and rows[-1] == "kmeans" and len(rows) == 26
+    assert rows[21:] == REGION_KEYS and len(rows) == 25   # kmeans yer tutucusu kaldırıldı (Chapter 6 k-means: Color)
 
 
 @pytest.mark.parametrize("key,values,reference", CASES, ids=[f"{c[0]}-{i}" for i, c in enumerate(CASES)])

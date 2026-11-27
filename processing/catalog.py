@@ -670,8 +670,6 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                                                   ("binary", "Otsu mask"), ("sure_bg", "Sure background"),
                                                   ("distance", "Distance"), ("surface", "Surface")), "overlay",
                            help="MARKERS: internal in colour, external dark, unknown gray."))),
-    Algorithm("kmeans", "K-Means Clustering", "segmentation", "Groups pixels into k color clusters.",
-              (IntParam("k", "Clusters k", 4, 2, 16), IntParam("attempts", "Attempts", 3, 1, 10))),
     # 06 — Color Processing
     Algorithm("color_space", "Color Space Conversion", "color",
               "Slides 24–41 / lab: converts RGB to a color model — RGB, CMY (C = 1 − R, slide 29), CMYK "
@@ -815,6 +813,54 @@ ALGORITHMS: tuple[Algorithm, ...] = (
                ChoiceParam("display", "Display", (("result", "Result"), ("difference", "|RGB − HSI| × 8")), "result",
                            help="RESULT: the chosen process.  |RGB − HSI| × 8: difference of the two processes "
                                 "(gray), as in Figs. 6.38c / 6.39c."))),
+    # 06 — renkli bölütleme (slayt 59–63; laboratuvar huethr, kmeans, skin, edges)
+    Algorithm("color_hue_threshold", "Hue Thresholding in HSV", "color",
+              "Slides 59–60 / lab: segmentation in RGB is difficult because color and brightness are mixed; in HSV an "
+              "object of one color occupies a narrow hue interval, so a box in (H, S, V) — cv2.inRange — separates it: "
+              "mask = 255 if H_lo ≤ H ≤ H_hi, S ≥ S_min and V ≥ V_min (OpenCV scale: H 0–179 = degrees / 2, S, V "
+              "0–255). Red wraps around 0: H_lo > H_hi gives two ranges [H_lo, 179] ∪ [0, H_hi]. Low-saturation pixels "
+              "have an unreliable hue, hence the S minimum. SEGMENTED keeps the masked colors (others black).",
+              (ChoiceParam("target", "Target", (("blue", "Blue (sky) · H 90–130"), ("green", "Green · H 35–85"),
+                                                ("yellow", "Yellow · H 20–34"), ("red", "Red (wraps around 0) · H 170–8"),
+                                                ("custom", "Custom · thresholds below")), "blue",
+                           help="Lab presets (H min, H max, S min, V min): blue 90, 130, 50, 50; green 35, 85, 60, 40; "
+                                "yellow 20, 34, 80, 80; red 170, 8, 90, 60."),
+               IntParam("h_min", "Custom · H min", 90, 0, 179, help="CUSTOM only. H min > H max wraps around 0 (red)."),
+               IntParam("h_max", "Custom · H max", 130, 0, 179, help="CUSTOM only."),
+               IntParam("s_min", "Custom · S min", 50, 0, 255, help="CUSTOM only."),
+               IntParam("v_min", "Custom · V min", 50, 0, 255, help="CUSTOM only."),
+               ChoiceParam("display", "Display", (("segmented", "Segmented"), ("mask", "Mask")), "segmented"))),
+    Algorithm("color_kmeans", "k-Means Clustering in Lab", "color",
+              "Slide 61 / lab: k-means groups pixels by color — assignment c(z) = argmin_k ‖z − μ_k‖² (every pixel "
+              "joins its nearest centre), update μ_k = (1/|C_k|) Σ z (every centre moves to the mean of its pixels); "
+              "it converges when no pixel changes cluster (at most 30 iterations). Initial centres: k-means++ from a "
+              "seeded random start (deterministic). In Lab the Euclidean distance matches the perceived color "
+              "difference. Each cluster is painted with the mean color of its pixels.",
+              (IntParam("k", "K · clusters", 4, *color_processing.KMEANS_K_RANGE),
+               ChoiceParam("features", "Features", (("lab", "L*a*b*"), ("ab", "a*b* only"), ("rgb", "RGB")), "lab",
+                           help="a*b* ONLY ignores lightness (shading); RGB for comparison."),
+               IntParam("seed", "Random start · seed", 3, *color_processing.KMEANS_SEED_RANGE,
+                        help="Change it for a new random start (lab: 'New random start'); same seed → same result."))),
+    Algorithm("color_skin", "Skin Regions in YCbCr", "color",
+              "Slide 62 / lab: skin of all ethnicities clusters in a compact region of the Cb–Cr plane while the "
+              "brightness Y varies a lot, so only the chroma is thresholded: skin ⇔ 133 ≤ Cr ≤ 173 and 77 ≤ Cb ≤ 127 "
+              "(Chai & Ngan); Y is not used. Cr = (R − Y)·0.713 + 128, Cb = (B − Y)·0.564 + 128 (OpenCV YCrCb). "
+              "Typical false positives: wood, sand, orange objects.",
+              (IntParam("cr_min", "Cr min", 133, 0, 255), IntParam("cr_max", "Cr max", 173, 0, 255),
+               IntParam("cb_min", "Cb min", 77, 0, 255), IntParam("cb_max", "Cb max", 127, 0, 255),
+               ChoiceParam("display", "Display", (("segmented", "Segmented"), ("mask", "Mask")), "segmented"))),
+    Algorithm("color_edges", "Color Edge Detection", "color",
+              "Slide 63 / lab: 3×3 Sobel gradients (border replicated). GRAYSCALE: |∇Y|. HSV V: |∇V|, V = max(R, G, "
+              "B). RGB COMBINED: max(|∇R|, |∇G|, |∇B|). DI ZENZO (vector gradient): gxx = Σ|∂c/∂x|², gyy = Σ|∂c/∂y|², "
+              "gxy = Σ ∂c/∂x·∂c/∂y, θ = ½ atan2(2gxy, gxx − gyy), F(θ) = √(½[(gxx + gyy) + (gxx − gyy) cos 2θ + "
+              "2gxy sin 2θ]). Boundaries between colors of equal brightness vanish in grayscale but are found by "
+              "the color methods.",
+              (ChoiceParam("method", "Gradient of", (("gray", "Grayscale"), ("v", "HSV V channel"),
+                                                     ("rgb", "RGB channels combined (max)"),
+                                                     ("dizenzo", "Vector gradient (Di Zenzo)")), "gray"),
+               IntParam("t", "Edge threshold T · |∇| > T", 120, *color_processing.EDGE_T_RANGE, step=5),
+               ChoiceParam("display", "Display", (("edges", "Edges · |∇| > T"), ("magnitude", "Magnitude · |∇| / 4")),
+                           "edges"))),
     # 07 — Feature Extraction
     Algorithm("sobel", "Sobel Edges", "features", "First-derivative gradient magnitude.",
               (ChoiceParam("direction", "Direction", (("x", "X"), ("y", "Y"), ("xy", "Magnitude")), "xy"),
@@ -903,6 +949,10 @@ IMPLEMENTATIONS = {
     "color_balance": color_processing.color_balance,
     "hsi_equalization": color_processing.hsi_equalization,
     "color_smooth_sharpen": color_processing.color_smoothing_sharpening,
+    "color_hue_threshold": color_processing.hue_thresholding,
+    "color_kmeans": color_processing.kmeans_lab,
+    "color_skin": color_processing.skin_regions,
+    "color_edges": color_processing.color_edge_detection,
 }
 
 

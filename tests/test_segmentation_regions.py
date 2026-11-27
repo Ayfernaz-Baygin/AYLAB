@@ -203,7 +203,7 @@ def ref_morph3(a, op, k):
 # ================================================================ katalog
 def test_region_operations_follow_edge_operations_in_source_order():
     keys = [a.key for a in REGISTRY.in_category("segmentation")]
-    assert keys[21:25] == REGION_KEYS and keys[-1] == "kmeans"
+    assert keys[21:] == REGION_KEYS and len(keys) == 25   # kmeans yer tutucusu kaldırıldı (Chapter 6 k-means: Color)
     assert [REGISTRY.get(k).title for k in REGION_KEYS] == [
         "Region Growing", "Region Splitting & Merging", "Watershed", "Marker-Controlled Watershed"]
     assert all(REGISTRY.get(k).implemented for k in REGION_KEYS)

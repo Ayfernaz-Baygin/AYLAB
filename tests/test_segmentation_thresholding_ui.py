@@ -60,7 +60,7 @@ CASES = [
 def test_thresholding_listed_in_segmentation_category(window):
     window.navigator.tiles["segmentation"].click()
     rows = list(window.navigator.operation_rows)
-    assert rows[:8] == KEYS and rows[-1] == "kmeans"            # Paket 2 kenar işlemleri arada
+    assert rows[:8] == KEYS and rows[-1] == "region_marker_watershed" and len(rows) == 25   # kmeans yer tutucusu kaldırıldı (Chapter 6 k-means: Color)
     assert len(window.navigator.tiles) == 7                     # yeni kategori yok
     assert window.accent == theme.wavelength_color(window.registry.category("segmentation").wavelength)
     assert "SEGMENTATION" in window.parameters.eyebrow.text()

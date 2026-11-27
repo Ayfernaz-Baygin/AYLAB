@@ -950,3 +950,278 @@ def color_smoothing_sharpening(image: np.ndarray, operation: str = "smooth", ker
                              f"{'RGB' if process == 'rgb' else 'HSI I'}", detail, (), tuple(rows),
                              section="SMOOTHING & SHARPENING")
     return ProcessResult(merge_alpha(np.ascontiguousarray(shown[..., ::-1]), alpha), report)
+
+
+# ====================================================================================================
+# Paket 5: renkli bölütleme — slayt 59–63, laboratuvar 'Hue Thresholding in HSV', 'k-Means Clustering in Lab',
+# 'Skin Regions in YCbCr', 'Color Edge Detection'. RGB'de bölütleme zordur (renk ve parlaklık karışık); HSV'de ton
+# eşikleme, Lab'da k-means, YCbCr'de ten bölgeleri (slayt 59). Laboratuvar kuralları aynen: OpenCV HSV ölçeği
+# (H 0–179, S, V 0–255), Lab ve gradyan ara değerleri Float32Array'de saklanır, Sobel kenarları tekrarlanır.
+# ====================================================================================================
+HUE_TARGETS = {"blue": (90, 130, 50, 50), "green": (35, 85, 60, 40), "yellow": (20, 34, 80, 80),
+               "red": (170, 8, 90, 60)}                 # laboratuvar HUE_PRE: (H min, H max, S min, V min)
+HUE_CHOICES = tuple(HUE_TARGETS) + ("custom",)
+SEG_DISPLAYS = ("segmented", "mask")
+KMEANS_FEATURES = ("lab", "ab", "rgb")
+KMEANS_K_RANGE = (2, 6)
+KMEANS_SEED_RANGE = (1, 9999)
+KMEANS_MAX_IT = 30                                      # laboratuvar kmeans(…, maxIt = 30)
+SKIN_RULE = (133, 173, 77, 127)                         # Cr min, Cr max, Cb min, Cb max (Chai & Ngan)
+EDGE_METHODS = ("gray", "v", "rgb", "dizenzo")
+EDGE_NAMES = {"gray": "Grayscale", "v": "HSV V channel", "rgb": "RGB channels combined (max)",
+              "dizenzo": "Vector gradient (Di Zenzo)"}
+EDGE_T_RANGE = (10, 600)
+EDGE_DISPLAYS = ("edges", "magnitude")
+SOBEL_X = (-1, 0, 1, -2, 0, 2, -1, 0, 1)
+SOBEL_Y = (-1, -2, -1, 0, 0, 0, 1, 2, 1)
+
+
+def _segmented(rgb: np.ndarray, mask: np.ndarray, display: str, alpha) -> np.ndarray:
+    """Laboratuvar: maske 0/255 (gri) ya da bölütlenmiş görüntü (maske dışı siyah); çıktı BGR."""
+    out = np.repeat(np.where(mask, 255, 0).astype(np.uint8)[..., None], 3, -1) if display == "mask" \
+        else np.where(mask[..., None], c8(rgb), 0).astype(np.uint8)
+    return merge_alpha(np.ascontiguousarray(out[..., ::-1]), alpha)
+
+
+def _px_text(rgb, y, x) -> str:
+    return f"pixel ({x}, {y}) RGB {tuple(int(v) for v in rgb[y, x])}"
+
+
+# ------------------------------------------------------------------ slayt 59–60: hue thresholding in HSV
+def hsv_cv(rgb: np.ndarray) -> np.ndarray:
+    """Laboratuvar rgb2hsvCV: H = round(H° / 2) mod 180, S = c8(255·S), V = c8(255·V) (OpenCV ölçeği)."""
+    v = rgb_to_model(rgb, "hsv")
+    return np.stack([js_round(v[..., 0] / 2) % 180, c8(v[..., 1] * 255), c8(v[..., 2] * 255)], -1).astype(np.int64)
+
+
+def hue_in_range(h: np.ndarray, lo: int, hi: int) -> np.ndarray:
+    """lo ≤ hi: lo ≤ H ≤ hi; lo > hi (kırmızı, 0'dan sarar): H ≥ lo veya H ≤ hi — iki aralık."""
+    return (h >= lo) & (h <= hi) if lo <= hi else (h >= lo) | (h <= hi)
+
+
+def hue_thresholding(image: np.ndarray, target: str = "blue", h_min: int = 90, h_max: int = 130, s_min: int = 50,
+                     v_min: int = 50, display: str = "segmented") -> ProcessResult:
+    """Hue thresholding in HSV (slayt 59–60; laboratuvar; cv2.inRange): mask = 255 eğer H_lo ≤ H ≤ H_hi, S ≥ S_min,
+    V ≥ V_min. OpenCV ölçeği H 0–179. H_lo > H_hi ise aralık 0'dan sarar (kırmızı): iki aralık [H_lo, 179] ∪ [0, H_hi].
+    Hedef seçimi laboratuvar hazır ayarlarını kullanır; CUSTOM aşağıdaki eşikleri kullanır."""
+    _choice(target, "Target", HUE_CHOICES)
+    vals = (_number(h_min, "H min", 0, 179, integer=True), _number(h_max, "H max", 0, 179, integer=True),
+            _number(s_min, "S min", 0, 255, integer=True), _number(v_min, "V min", 0, 255, integer=True))
+    lo, hi, smin, vmin = HUE_TARGETS.get(target, vals)
+    _choice(display, "Display", SEG_DISPLAYS)
+    rgb, alpha = rgb_input(image)
+    hsv = hsv_cv(rgb)
+    h_ok, s_ok, v_ok = hue_in_range(hsv[..., 0], lo, hi), hsv[..., 1] >= smin, hsv[..., 2] >= vmin
+    mask = h_ok & s_ok & v_ok
+    n, kept = mask.size, int(mask.sum())
+    rng = f"H ∈ [{lo}, {hi}]" if lo <= hi else f"H ∈ [{lo}, 179] ∪ [0, {hi}] (wraps around 0)"
+    rows = [f"mask = 255 if {rng}, S ≥ {smin}, V ≥ {vmin}  (OpenCV H 0–179, S, V 0–255)",
+            f"hue matches but S or V too low: {int((h_ok & ~(s_ok & v_ok)).sum())} px (unreliable hue)"]
+    if n:
+        cand = np.argwhere(h_ok & ~s_ok)                         # laboratuvar notu: ton uyuyor, doygunluk düşük
+        y, x = (cand[0] if len(cand) else np.argwhere(mask)[0] if kept else (rgb.shape[0] // 2, rgb.shape[1] // 2))
+        H, S, V = (int(v) for v in hsv[y, x])
+        ok = lambda b: "✓" if b else "✗"
+        rows += [_px_text(rgb, y, x) + f": H {H} {ok(h_ok[y, x])}, S {S} ≥ {smin} {ok(s_ok[y, x])}, "
+                                     f"V {V} ≥ {vmin} {ok(v_ok[y, x])} → mask {255 if mask[y, x] else 0}"]
+    name = "custom" if target == "custom" else f"{target} (lab preset)"
+    report = FullColorReport(f"Hue thresholding · {name}", f"{rng}, S ≥ {smin}, V ≥ {vmin}: {kept} of {n} px "
+                             f"({100 * kept / max(1, n):.1f} %) in the mask", (), tuple(rows), section="COLOR SEGMENTATION")
+    return ProcessResult(_segmented(rgb, mask, display, alpha), report)
+
+
+# ------------------------------------------------------------------ slayt 61: k-means in Lab
+def kmeans_features(rgb: np.ndarray, space: str) -> np.ndarray:
+    """Laboratuvar feats: piksel başına (L*, a*, b*), (a*, b*) ya da (R, G, B); Float32Array saklaması."""
+    if space == "rgb":
+        x = rgb.reshape(-1, 3)
+    else:
+        lab = rgb_to_model(rgb, "lab").reshape(-1, 3)
+        x = lab[:, 1:] if space == "ab" else lab
+    return x.astype(np.float32).astype(np.float64)
+
+
+def lab_kmeans(X: np.ndarray, K: int, seed: int, max_it: int = KMEANS_MAX_IT) -> dict:
+    """Laboratuvar kmeans: LCG (s·1664525 + 1013904223 mod 2³²) ile k-means++ başlangıcı; atama c(z) = argmin_k
+    ‖z − μ_k‖², güncelleme μ_k = ortalama; değişen piksel yoksa ya da merkezler kımıldamıyorsa (|Δ| ≤ 1e−6) dur.
+    Boş kümenin merkezi yerinde kalır."""
+    n, dim = X.shape
+    s = seed & 0xFFFFFFFF
+
+    def rnd() -> float:
+        nonlocal s
+        s = (s * 1664525 + 1013904223) & 0xFFFFFFFF
+        return s / 4294967296
+
+    def dist2(c):
+        d = np.zeros(n)
+        for j in range(dim):                                   # laboratuvar sırası: Σ_j (z_j − c_j)²
+            t = X[:, j] - c[j]
+            d = d + t * t
+        return d
+
+    first = int(rnd() * n)
+    init_idx, centers = [first], [X[first].copy()]
+    while len(centers) < K:
+        d = dist2(centers[0])
+        for c in centers[1:]:
+            d = np.minimum(d, dist2(c))
+        cum = np.cumsum(d)                                     # laboratuvar: tot sıralı toplam, r −= d[i] ≤ 0
+        r = rnd() * cum[-1]
+        hit = np.nonzero(r - cum <= 0)[0]
+        pick = int(hit[0]) if len(hit) else 0
+        init_idx.append(pick)
+        centers.append(X[pick].copy())
+    cur = np.array(centers)
+    labels = np.full(n, -1)
+    its = []
+    for _ in range(max_it):
+        dists = np.stack([dist2(c) for c in cur], 0)
+        new = np.argmin(dists, axis=0)                          # ilk en küçük (laboratuvar: d < bd)
+        changed = int((new != labels).sum())
+        cnt = np.bincount(new, minlength=K)
+        sums = np.stack([np.bincount(new, weights=X[:, j], minlength=K) for j in range(dim)], -1)
+        nxt = np.where(cnt[:, None] > 0, sums / np.maximum(cnt, 1)[:, None], cur)
+        its.append({"changed": changed, "counts": cnt})
+        moved = bool(np.any(np.abs(nxt - cur) > 1e-6))
+        labels, cur = new, nxt
+        if not changed or not moved:
+            break
+    return {"init_idx": init_idx, "labels": labels, "centers": cur, "its": its}
+
+
+def kmeans_lab(image: np.ndarray, k: int = 4, features: str = "lab", seed: int = 3) -> ProcessResult:
+    """k-Means clustering in Lab (slayt 61; laboratuvar): pikseller renge göre K kümeye ayrılır — atama
+    c(z) = argmin_k ‖z − μ_k‖², güncelleme μ_k = (1/|C_k|) Σ z, atamalar değişmeyince yakınsar. Lab'da Öklid uzaklığı
+    algılanan renk farkına uyar. Her küme kendi piksellerinin ortalama RGB rengiyle boyanır (slayt 61)."""
+    k = _number(k, "K", *KMEANS_K_RANGE, integer=True)
+    _choice(features, "Features", KMEANS_FEATURES)
+    seed = _number(seed, "Seed", *KMEANS_SEED_RANGE, integer=True)
+    rgb, alpha = rgb_input(image)
+    X = kmeans_features(rgb, features)
+    n = X.shape[0]
+    if n < k:
+        raise AlgorithmParameterError(f"K = {k} needs at least {k} pixels (image has {n}).")
+    km = lab_kmeans(X, k, seed)
+    labels = km["labels"]
+    flat = rgb.reshape(-1, 3)
+    cnt = np.bincount(labels, minlength=k)
+    mean = np.stack([np.bincount(labels, weights=flat[:, c], minlength=k) for c in range(3)], -1) / np.maximum(cnt, 1)[:, None]
+    mean = np.where(cnt[:, None] > 0, mean, 128.0)             # laboratuvar meanRGB: boş küme gri
+    out = c8(mean[labels]).reshape(rgb.shape)
+    it = len(km["its"])
+    conv = it < KMEANS_MAX_IT or km["its"][-1]["changed"] == 0          # 30 yinelemeden önce durduysa yakınsadı
+    feat = {"lab": "(L*, a*, b*)", "ab": "(a*, b*) — color only, lightness ignored", "rgb": "(R, G, B)"}[features]
+    rows = ["assignment c(z) = argmin_k ‖z − μ_k‖²,  update μ_k = (1/|C_k|) Σ z",
+            f"features {feat}; k-means++ start (seed {seed}), initial pixels {km['init_idx']}",
+            f"{'converged' if conv else 'stopped (max 30 iterations)'} after {it} iteration(s); last step: "
+            f"{km['its'][-1]['changed']} px changed cluster"]
+    for j in range(k):
+        mu = ", ".join(f"{v:.1f}" for v in km["centers"][j])
+        col = tuple(int(v) for v in c8(mean[j]))
+        rows.append(f"cluster {j + 1}: {int(cnt[j])} px, μ = ({mu}), mean RGB {col}")
+    i0 = min(n - 1, (rgb.shape[0] // 2) * rgb.shape[1] + rgb.shape[1] // 2)   # örnek piksel: görüntü ortası
+    d = np.sqrt([((X[i0] - c) ** 2).sum() for c in km["centers"]])
+    y0, x0 = divmod(i0, rgb.shape[1])
+    rows.append(_px_text(rgb, y0, x0) + ": ‖z − μ‖ = " + ", ".join(f"{v:.1f}" for v in d) + f" → cluster {int(labels[i0]) + 1}")
+    report = FullColorReport(f"k-Means · {features.upper() if features != 'ab' else 'a*b*'}, K = {k}",
+                             f"{k} clusters in {feat.split(' —')[0]}, {it} iteration(s), sizes "
+                             + ", ".join(str(int(c)) for c in cnt), (), tuple(rows), section="COLOR SEGMENTATION")
+    return ProcessResult(merge_alpha(np.ascontiguousarray(out[..., ::-1]), alpha), report)
+
+
+# ------------------------------------------------------------------ slayt 62: skin regions in YCbCr
+def skin_regions(image: np.ndarray, cr_min: int = 133, cr_max: int = 173, cb_min: int = 77, cb_max: int = 127,
+                 display: str = "segmented") -> ProcessResult:
+    """Skin regions in YCbCr (slayt 62; laboratuvar; Chai & Ngan): ten ⇔ 133 ≤ Cr ≤ 173 ve 77 ≤ Cb ≤ 127. Y yok
+    sayılır, bu yüzden çok farklı parlaklıktaki tenler aynı küçük Cb–Cr kutusuna düşer. Cr = (R − Y)·0.713 + 128,
+    Cb = (B − Y)·0.564 + 128, Y = 0.299R + 0.587G + 0.114B (OpenCV YCrCb)."""
+    lims = [_number(v, n, 0, 255, integer=True) for v, n in ((cr_min, "Cr min"), (cr_max, "Cr max"),
+                                                             (cb_min, "Cb min"), (cb_max, "Cb max"))]
+    _choice(display, "Display", SEG_DISPLAYS)
+    rgb, alpha = rgb_input(image)
+    ycc = rgb_to_model(rgb, "ycbcr")                            # (Y, Cb, Cr) — Y kullanılmaz
+    cb, cr = ycc[..., 1], ycc[..., 2]
+    mask = (cr >= lims[0]) & (cr <= lims[1]) & (cb >= lims[2]) & (cb <= lims[3])
+    n, kept = mask.size, int(mask.sum())
+    rows = [f"skin ⇔ {lims[0]} ≤ Cr ≤ {lims[1]} and {lims[2]} ≤ Cb ≤ {lims[3]}  (Y not used)",
+            "Cr = (R − Y)·0.713 + 128,  Cb = (B − Y)·0.564 + 128"]
+    if n:
+        y, x = np.argwhere(mask)[0] if kept else (rgb.shape[0] // 2, rgb.shape[1] // 2)
+        Y, Cb, Cr = ycc[y, x]
+        ok = lambda b: "✓" if b else "✗"
+        rows.append(_px_text(rgb, y, x) + f": Y {Y:.1f} (not used), Cr {Cr:.1f} {ok(lims[0] <= Cr <= lims[1])}, "
+                                         f"Cb {Cb:.1f} {ok(lims[2] <= Cb <= lims[3])} → {'skin' if mask[y, x] else 'not skin'}")
+    report = FullColorReport("Skin regions · YCbCr", f"{lims[0]} ≤ Cr ≤ {lims[1]}, {lims[2]} ≤ Cb ≤ {lims[3]}: "
+                             f"{kept} of {n} px ({100 * kept / max(1, n):.1f} %) skin", (), tuple(rows),
+                             section="COLOR SEGMENTATION")
+    return ProcessResult(_segmented(rgb, mask, display, alpha), report)
+
+
+# ------------------------------------------------------------------ slayt 63: color edge detection
+def lab_sobel(g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Laboratuvar sobel(windowAt(·, 3)): Σ SX·w, Σ SY·w (satır sırası, kenarlar tekrarlanır), float32 saklanır."""
+    gx = np.zeros(g.shape)
+    gy = np.zeros(g.shape)
+    for cx, cy, v in zip(SOBEL_X, SOBEL_Y, _windows(g.astype(np.float64), 3)):
+        gx = gx + cx * v
+        gy = gy + cy * v
+    return gx.astype(np.float32).astype(np.float64), gy.astype(np.float32).astype(np.float64)
+
+
+def edge_gradient(rgb: np.ndarray, method: str) -> tuple[np.ndarray, list, dict]:
+    """Laboratuvar edgeData: kanal(lar), Sobel gradyanları ve |∇| (float32). GRAY: Y = c8(luma); V: max(R, G, B);
+    RGB: max_c √(gx_c² + gy_c²); DI ZENZO: g_xx = Σ gx², g_yy = Σ gy², g_xy = Σ gx·gy, θ = ½ atan2(2g_xy, g_xx − g_yy),
+    F(θ) = √(½[(g_xx + g_yy) + (g_xx − g_yy) cos 2θ + 2 g_xy sin 2θ])."""
+    if method == "gray":
+        chans = [c8(0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(np.float64)]
+    elif method == "v":
+        chans = [rgb.max(axis=-1)]
+    else:
+        chans = [rgb[..., c] for c in range(3)]
+    grads = [lab_sobel(c) for c in chans]
+    extra = {}
+    if method == "dizenzo":
+        gxx = sum(gx * gx for gx, _ in grads)
+        gyy = sum(gy * gy for _, gy in grads)
+        gxy = sum(gx * gy for gx, gy in grads)
+        th = 0.5 * np.arctan2(2 * gxy, gxx - gyy)
+        mag = np.sqrt(np.maximum(0, 0.5 * ((gxx + gyy) + (gxx - gyy) * np.cos(2 * th) + 2 * gxy * np.sin(2 * th))))
+        extra = {"gxx": gxx, "gyy": gyy, "gxy": gxy, "th": th}
+    elif method == "rgb":
+        mag = np.max([np.hypot(gx, gy) for gx, gy in grads], axis=0)
+    else:
+        mag = np.hypot(*grads[0])
+    return mag.astype(np.float32).astype(np.float64), grads, extra
+
+
+def color_edge_detection(image: np.ndarray, method: str = "gray", t: int = 120, display: str = "edges") -> ProcessResult:
+    """Color edge detection (slayt 63; laboratuvar): 3×3 Sobel gradyanı gri tonlamada, HSV V'de, her RGB kanalında
+    (maks ile birleşik) ya da renk vektöründe (Di Zenzo). Eşit parlaklıktaki renkler arasındaki kenar gri tonlamada
+    kaybolur, renkli yöntemlerle bulunur. EDGES: |∇| > T → 255; MAGNITUDE: c8(|∇| / 4)."""
+    _choice(method, "Gradient of", EDGE_METHODS)
+    t = _number(t, "T", *EDGE_T_RANGE, integer=True)
+    _choice(display, "Display", EDGE_DISPLAYS)
+    rgb, alpha = rgb_input(image)
+    mag, grads, extra = edge_gradient(rgb, method)
+    edges = mag > t
+    shown = np.where(edges, 255, 0).astype(np.uint8) if display == "edges" else c8(mag / 4)
+    n, ne = edges.size, int(edges.sum())
+    form = {"gray": "|∇Y| = √(gx² + gy²), Y = 0.299R + 0.587G + 0.114B", "v": "|∇V| = √(gx² + gy²), V = max(R, G, B)",
+            "rgb": "|∇| = max(|∇R|, |∇G|, |∇B|)",
+            "dizenzo": "F(θ) = √(½[(gxx + gyy) + (gxx − gyy) cos 2θ + 2gxy sin 2θ]), θ = ½ atan2(2gxy, gxx − gyy)"}[method]
+    rows = [form, "Sobel 3×3: gx = [−1 0 1; −2 0 2; −1 0 1], gy = transpose; border replicate (lab)",
+            f"edge ⇔ |∇| > T = {t}; magnitude shown as c8(|∇| / 4)"]
+    if n:
+        y, x = np.unravel_index(int(np.argmax(mag)), mag.shape)
+        names = ["Y"] if method == "gray" else ["V"] if method == "v" else ["R", "G", "B"]
+        parts = ", ".join(f"{nm}: gx {gx[y, x]:.0f}, gy {gy[y, x]:.0f}" for nm, (gx, gy) in zip(names, grads))
+        rows.append(_px_text(rgb, y, x) + f" (strongest): {parts}")
+        if method == "dizenzo":
+            rows.append(f"  gxx {extra['gxx'][y, x]:.0f}, gyy {extra['gyy'][y, x]:.0f}, gxy {extra['gxy'][y, x]:.0f}, "
+                        f"θ {np.degrees(extra['th'][y, x]):.1f}° → F = {mag[y, x]:.0f}")
+        else:
+            rows.append(f"  |∇| = {mag[y, x]:.0f} {'>' if edges[y, x] else '≤'} T = {t}")
+    report = FullColorReport(f"Color edges · {EDGE_NAMES[method]}", f"{ne} of {n} px with |∇| > {t}, max |∇| = "
+                             f"{mag.max(initial=0):.0f}", (), tuple(rows), section="COLOR SEGMENTATION")
+    return ProcessResult(merge_alpha(np.ascontiguousarray(np.repeat(shown[..., None], 3, -1)), alpha), report)

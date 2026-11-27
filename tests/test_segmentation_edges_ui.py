@@ -70,7 +70,7 @@ CASES = [
 def test_edge_operations_listed_after_thresholding(window):
     window.navigator.tiles["segmentation"].click()
     rows = list(window.navigator.operation_rows)
-    assert rows[8:21] == EDGE_KEYS and rows[-1] == "kmeans" and len(rows) == 26   # Paket 3: 4 bölge işlemi arada
+    assert rows[8:21] == EDGE_KEYS and len(rows) == 25   # Paket 3: 4 bölge işlemi; kmeans yer tutucusu kaldırıldı (Chapter 6 k-means: Color)
     assert all(k.startswith("region_") for k in rows[21:25])
     assert len(window.navigator.tiles) == 7
 

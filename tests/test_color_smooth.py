@@ -87,7 +87,7 @@ def patches(h=30, w=42):
 # ================================================================ katalog
 def test_catalog_entry_follows_the_slides():
     keys = [a.key for a in REGISTRY.in_category("color")]
-    assert keys[-1] == "color_smooth_sharpen" and keys[-2] == "hsi_equalization" and len(keys) == 11
+    assert keys[10] == "color_smooth_sharpen" and keys[9] == "hsi_equalization" and len(keys) == 15   # + Paket 5
     algo = REGISTRY.get("color_smooth_sharpen")
     assert algo.title == "Color Smoothing & Sharpening" and algo.func is C.color_smoothing_sharpening
     sig = inspect.signature(C.color_smoothing_sharpening)

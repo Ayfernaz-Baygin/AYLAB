@@ -197,7 +197,7 @@ def scene(h=40, w=56, seed=0, noise=4.0):
 # ================================================================ katalog
 def test_edge_operations_follow_slide_order_after_thresholding():
     keys = [a.key for a in REGISTRY.in_category("segmentation")]
-    assert keys[8:21] == EDGE_KEYS and keys[-1] == "kmeans"
+    assert keys[8:21] == EDGE_KEYS and len(keys) == 25   # kmeans yer tutucusu kaldırıldı (Chapter 6 k-means: Color)
     assert all(REGISTRY.get(k).implemented for k in EDGE_KEYS)
     assert [REGISTRY.get(k).title for k in EDGE_KEYS] == [
         "Discontinuities & Derivatives", "Point Detection", "Line Detection", "Gradient (First-Order Derivative)",

@@ -151,9 +151,9 @@ def rand_img(shape, seed):
 def test_segmentation_category_lists_thresholding_in_source_order():
     keys = [a.key for a in REGISTRY.in_category("segmentation")]
     assert keys[:8] == KEYS
-    assert keys[-1] == "kmeans" and not REGISTRY.get("kmeans").implemented   # kapsam dışı, yer tutucu kaldı
+    assert len(keys) == 25 and all(REGISTRY.get(k).implemented for k in keys)   # kmeans yer tutucusu kaldırıldı (Chapter 6 k-means: Color)
     assert all(k.startswith("edge_") for k in keys[8:21])                       # Paket 2: kenar tabanlı işlemler
-    assert all(k.startswith("region_") for k in keys[21:-1])                    # Paket 3: bölge tabanlı işlemler
+    assert all(k.startswith("region_") for k in keys[21:])                      # Paket 3: bölge tabanlı işlemler
     assert all(REGISTRY.get(k).implemented for k in KEYS)
     assert [REGISTRY.get(k).title for k in KEYS] == [
         "Manual / Fixed Threshold", "Automatic Global Threshold", "Otsu's Method", "Adaptive Mean Threshold",
